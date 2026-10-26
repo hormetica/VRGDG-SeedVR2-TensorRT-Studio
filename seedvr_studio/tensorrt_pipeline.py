@@ -5,21 +5,21 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
 from .cancellation import cancellation_requested
-from .media import MediaError, probe, resolve_frame_rate
+from .encoding import ExportSettings
+from .finishing import PostprocessSettings, finish_decoded_video, finishing_manifest
+from .media import MediaError, RenderCancelledError, probe, resolve_frame_rate
 from .paths import ROOT, VENV_PYTHON
 from .persistent_decoder import run_persistent_decoder
 
-
 TRT_RUNNER = ROOT / "tools" / "run_tensorrt_tiled.py"
-TRT_ASSEMBLER = ROOT / "tools" / "assemble_tensor_video.py"
-TRT_POSTPROCESS = ROOT / "tools" / "postprocess_tensor_video.py"
 TRT_ARTIFACTS = ROOT / "tensorrt_backend" / "artifacts"
 TRT_ENGINE_21F = TRT_ARTIFACTS / "vae_decoder_tile_256_21f.rtxplan"
 TRT_ENGINE_5F = TRT_ARTIFACTS / "vae_decoder_tile_512_5f.rtxplan"
@@ -99,7 +99,7 @@ def _stable_decode(
                 f"Stable TensorRT VAE decoding batch {index} of {len(profiles)}",
             )
         result = subprocess.run(
-            command, cwd=ROOT, env=child_env, text=True, encoding="utf-8", errors="replace", capture_output=True
+            command, cwd=ROOT, env=child_env, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False
         )
         _safe_print(result.stdout, end="")
         if result.returncode:
@@ -111,6 +111,7 @@ def _stable_decode(
 def _optimized_decode(
     profiles: list[dict[str, Any]], manifest_path: Path, child_env: dict[str, str],
     progress_callback: ProgressCallback | None,
+    finishing: dict | None = None,
 ) -> list[Path]:
     engines = {str(profile["engine"]) for profile in profiles}
     tiles = {int(profile["tile"]) for profile in profiles}
@@ -124,14 +125,18 @@ def _optimized_decode(
         "overlap_latent": next(iter(overlaps)),
         "jobs": [{"latent": str(profile["latent"]), "output": str(profile["output"])} for profile in profiles],
     }
+    if finishing is not None:
+        manifest["finishing"] = finishing
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if progress_callback:
         progress_callback(0.78, f"Starting optimized TensorRT decoder for {len(profiles)} batches")
-    run_persistent_decoder(manifest_path, len(profiles), child_env, progress_callback)
+    run_persistent_decoder(manifest_path, len(profiles), child_env, progress_callback, combined=finishing is not None)
     outputs = [Path(profile["output"]) for profile in profiles]
     missing = [str(path) for path in outputs if not path.exists()]
     if missing:
         raise MediaError("Optimized decoder did not create: " + ", ".join(missing))
+    if finishing is not None and not Path(finishing["output"]).exists():
+        raise MediaError("GPU finishing did not create the requested output")
     return outputs
 
 
@@ -145,10 +150,30 @@ def decode_postprocess_and_assemble(
 ) -> Path:
     decoded_dir = output.parent / "tensorrt_decoded"
     decoded_dir.mkdir(parents=True, exist_ok=True)
-    latent_files = sorted(capture_dir.glob("vae_latent_*.pt"))
+    latent_files = sorted(capture_dir.glob("vae_latent_*.pt"), key=lambda path: int(path.stem.rsplit("_", 1)[1]))
     if not latent_files:
         raise MediaError(f"TensorRT render produced no VAE latents in {capture_dir}")
     profiles = _profile_latents(latent_files)
+    effects = None
+    if settings.sharpen_enabled or settings.grain_enabled or settings.microtexture_enabled or settings.skin_finishing_enabled:
+        effects = PostprocessSettings(
+            sharpen_strength=settings.sharpen_strength if settings.sharpen_enabled else 0.0,
+            grain_intensity=settings.grain_intensity if settings.grain_enabled else 0.0,
+            grain_saturation=settings.grain_saturation,
+            microtexture_strength=settings.microtexture_strength if settings.microtexture_enabled else 0.0,
+            skin_evenness=settings.skin_evenness if settings.skin_finishing_enabled else 0.0,
+            skin_smoothing=settings.skin_smoothing if settings.skin_finishing_enabled else 0.0,
+            skin_redness=settings.skin_redness if settings.skin_finishing_enabled else 0.0,
+            skin_shine=settings.skin_shine if settings.skin_finishing_enabled else 0.0,
+            blemish_mode=settings.blemish_mode if settings.skin_finishing_enabled else "off",
+            preserve_marks=settings.preserve_marks,
+            seed=settings.seed,
+        )
+    source_fps = resolve_frame_rate(getattr(settings, "source_fps", 0.0), probe(source).fps)
+    target_size = _unpadded_output_size(source, settings.resolution, settings.max_resolution)
+    export = ExportSettings(preset=getattr(settings, "export_preset", "software_h264"))
+    scene_cuts = bool(getattr(settings, "scene_cut_detection", False))
+    gpu_finishing = bool(getattr(settings, "gpu_finishing", False))
     requested = str(getattr(settings, "decoder_mode", "optimized_fast")).lower()
     requested = requested if requested in {"stable", "optimized", "optimized_fast"} else "optimized_fast"
     record: dict[str, Any] = {
@@ -166,12 +191,24 @@ def decode_postprocess_and_assemble(
     if requested in {"optimized", "optimized_fast"}:
         try:
             decoded_files = _optimized_decode(
-                profiles, output.parent / "persistent-decode-manifest.json", child_env, progress_callback
+                profiles, output.parent / "persistent-decode-manifest.json", child_env, progress_callback,
+                finishing_manifest(
+                    [Path(profile["output"]) for profile in profiles], output, source,
+                    fps=source_fps, seam_mode=settings.seam_mode, seam_frames=settings.seam_frames,
+                    effects=effects, target_size=target_size, export=export, scene_cut_detection=scene_cuts,
+                ) if gpu_finishing else None,
             )
-            record["used"] = "optimized-fast" if requested == "optimized_fast" else "optimized"
+            record["used"] = "optimized-gpu-finishing" if gpu_finishing else (
+                "optimized-fast" if requested == "optimized_fast" else "optimized"
+            )
+            if gpu_finishing:
+                record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+                if progress_callback:
+                    progress_callback(1.0, "GPU decode and finishing complete")
+                return output
         except Exception as exc:
             if cancellation_requested():
-                raise MediaError("Render cancelled") from exc
+                raise RenderCancelledError("Render cancelled") from exc
             record["fallback_reason"] = str(exc)
             _safe_print(f"Optimized decoder failed; retrying saved latents with Stable decoder: {exc}")
             if progress_callback:
@@ -185,50 +222,15 @@ def decode_postprocess_and_assemble(
         record["used"] = "stable"
     record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
-    selected_files: list[Path] = []
-    for index, decoded in enumerate(decoded_files, start=1):
-        if settings.sharpen_enabled or settings.grain_enabled or settings.microtexture_enabled or settings.skin_finishing_enabled:
-            processed = decoded_dir / f"processed_{index:03d}.pt"
-            effects = [
-                str(VENV_PYTHON), str(TRT_POSTPROCESS), str(decoded), "--output", str(processed),
-                "--frame-start", str((index - 1) * settings.batch_size), "--seed", str(settings.seed),
-                "--sharpen-strength", str(settings.sharpen_strength if settings.sharpen_enabled else 0.0),
-                "--microtexture-strength", str(settings.microtexture_strength if settings.microtexture_enabled else 0.0),
-                "--skin-evenness", str(settings.skin_evenness if settings.skin_finishing_enabled else 0.0),
-                "--skin-smoothing", str(settings.skin_smoothing if settings.skin_finishing_enabled else 0.0),
-                "--skin-redness", str(settings.skin_redness if settings.skin_finishing_enabled else 0.0),
-                "--skin-shine", str(settings.skin_shine if settings.skin_finishing_enabled else 0.0),
-                "--blemish-mode", settings.blemish_mode if settings.skin_finishing_enabled else "off",
-                "--grain-intensity", str(settings.grain_intensity if settings.grain_enabled else 0.0),
-                "--grain-saturation", str(settings.grain_saturation),
-            ]
-            if settings.skin_finishing_enabled and settings.preserve_marks:
-                effects.append("--preserve-marks")
-            effect_result = subprocess.run(
-                effects, cwd=ROOT, env=child_env, text=True, encoding="utf-8", errors="replace", capture_output=True
-            )
-            _safe_print(effect_result.stdout, end="")
-            if effect_result.returncode:
-                raise MediaError(f"TensorRT post-processing failed:\n{effect_result.stderr[-4000:]}")
-            selected_files.append(processed)
-        else:
-            selected_files.append(decoded)
-
-    source_fps = resolve_frame_rate(getattr(settings, "source_fps", 0.0), probe(source).fps)
-    target_width, target_height = _unpadded_output_size(
-        source, settings.resolution, settings.max_resolution
+    finish_decoded_video(
+        decoded_files, output, source, child_env, fps=source_fps,
+        seam_mode=settings.seam_mode, seam_frames=settings.seam_frames,
+        effects=effects, target_size=target_size, export=export, scene_cut_detection=scene_cuts,
+        progress_callback=(
+            (lambda fraction, message: progress_callback(0.9 + 0.1 * fraction, message))
+            if progress_callback else None
+        ),
     )
-    assemble = [
-        str(VENV_PYTHON), str(TRT_ASSEMBLER), *map(str, selected_files), "--output", str(output),
-        "--audio", str(source), "--fps", f"{source_fps:.9g}", "--seam-mode", settings.seam_mode, "--seam-frames", str(settings.seam_frames),
-        "--target-width", str(target_width), "--target-height", str(target_height),
-    ]
-    result = subprocess.run(
-        assemble, cwd=ROOT, env=child_env, text=True, encoding="utf-8", errors="replace", capture_output=True
-    )
-    _safe_print(result.stdout, end="")
-    if result.returncode:
-        raise MediaError(f"TensorRT video assembly failed:\n{result.stderr[-4000:]}")
     if progress_callback:
         progress_callback(1.0, f"TensorRT render complete · decoder: {record['used']}")
     return output

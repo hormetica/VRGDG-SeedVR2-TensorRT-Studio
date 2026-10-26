@@ -10,11 +10,13 @@ let syncFrame = 0;
 let zoom = 1, panX = 0, panY = 0, originX = 50, originY = 50, drag = '', dragX = 0, dragY = 0, baseX = 0, baseY = 0;
 let currentOutputPath = '', currentOutputReprocessable = false;
 let selectedSourceFile = null;
+let renderBusy = false, recommendingSettings = false;
 const SETTINGS_STORAGE_KEY = 'seedvr-studio-render-settings-v2';
 const LEGACY_SETTINGS_STORAGE_KEY = 'seedvr-studio-render-settings-v1';
 const SAVED_SETTING_IDS = [
   'backend', 'preset', 'output-preset', 'crop-policy', 'chunked-render', 'chunk-seconds',
   'model', 'batch-size', 'seed', 'color', 'attention', 'blocks', 'vae-tiling',
+  'gpu-finishing', 'warm-worker', 'scene-cut-detection', 'export-preset',
   'sharpen', 'sharpen-strength', 'microtexture', 'microtexture-strength',
   'skin-finishing', 'skin-evenness', 'skin-smoothing', 'skin-redness', 'skin-shine', 'blemish-mode', 'preserve-marks',
   'grain', 'grain-intensity', 'grain-saturation', 'seam-enabled',
@@ -36,6 +38,17 @@ const loadSavedSettings = () => {
   } catch (_) { return null; }
 };
 const refreshSettingsUi = () => {
+  const tensorRT = $('#backend').value.includes('TensorRT');
+  const features = window.__seedvrFeatures || {};
+  $('#recommend-settings').disabled = renderBusy || recommendingSettings || features.hardware_recommendations !== true;
+  $('#recommend-settings').title = features.hardware_recommendations === true ? '' : 'Restart SeedVR Studio to enable hardware recommendations.';
+  const capabilities = {'gpu-finishing': features.gpu_finishing, 'warm-worker': features.warm_worker,
+    'scene-cut-detection': features.scene_cut_detection, 'export-preset': window.__seedvrExportAvailable};
+  ['gpu-finishing', 'warm-worker', 'scene-cut-detection', 'export-preset'].forEach((id) => {
+    const element = document.getElementById(id);
+    element.disabled = !tensorRT || capabilities[id] !== true;
+    element.title = capabilities[id] === true ? '' : 'Restart SeedVR Studio to enable this backend feature.';
+  });
   $('#chunk-length-wrap').hidden = !$('#chunked-render').checked;
   $('#seam-warning').hidden = $('#seam-enabled').checked;
   $('#blocks-value').textContent = $('#blocks').value;
@@ -150,8 +163,10 @@ $('#save-settings').addEventListener('click', saveCurrentSettings);
 window.addEventListener('pageshow', () => setTimeout(restoreSettings, 0));
 setWipe(50); applyTransform(); updateEmptyState(); update(); loadOutputs();
 
-let activeJob = null, lastFailedJob = null, elapsedTimer = null, elapsedStarted = 0, projectToken = 0;
-const beginNewProject = (file) => { projectToken += 1; const previousJob = activeJob; activeJob = null; lastFailedJob = null; currentOutputPath = ''; currentOutputReprocessable = false; stopElapsed(0); setRenderBusy(false); loadVideo(after, ''); $('#reprocess-post').hidden = true; $('#open-output-folder').hidden = true; $('#media-info').textContent = `${file.name} · new project`; $('#render-status').textContent = previousJob ? 'New project ready · previous render continues in background' : 'Ready'; };
+let activeJob = null, lastFailedJob = null, elapsedTimer = null, elapsedStarted = 0, projectToken = 0, lastProfileJob = null;
+$('#performance-report').addEventListener('click', () => { if (lastProfileJob) window.open(`/api/jobs/${lastProfileJob}/profile`, '_blank', 'noopener'); });
+$('#load-output').addEventListener('click', () => { lastProfileJob = null; $('#performance-report').hidden = true; });
+const beginNewProject = (file) => { projectToken += 1; const previousJob = activeJob; activeJob = null; lastFailedJob = null; lastProfileJob = null; $('#performance-report').hidden = true; currentOutputPath = ''; currentOutputReprocessable = false; stopElapsed(0); setRenderBusy(false); loadVideo(after, ''); $('#reprocess-post').hidden = true; $('#open-output-folder').hidden = true; $('#media-info').textContent = `${file.name} · new project`; $('#render-status').textContent = previousJob ? 'New project ready · previous render continues in background' : 'Ready'; };
 const formatElapsed = (seconds) => { const total = Math.max(0, Math.floor(Number(seconds) || 0)); return `${String(Math.floor(total / 60)).padStart(2,'0')}:${String(total % 60).padStart(2,'0')}`; };
 const updateEta = (progress) => { const p = Number(progress) || 0; const elapsed = (performance.now() - elapsedStarted) / 1000; if (p < 0.05 || elapsed < 5) { $('#eta-time').textContent = 'Estimating…'; return; } $('#eta-time').textContent = `~${formatElapsed(elapsed * (1 - Math.min(p, 0.99)) / p)}`; };
 const startElapsed = () => { clearInterval(elapsedTimer); elapsedStarted = performance.now(); $('#elapsed-time').textContent = '00:00'; $('#eta-time').textContent = 'Estimating…'; elapsedTimer = setInterval(() => { const elapsed = (performance.now() - elapsedStarted) / 1000; $('#elapsed-time').textContent = formatElapsed(elapsed); updateEta(window.__seedvrProgress || 0); }, 250); };
@@ -171,6 +186,11 @@ const renderForm = (type, sourceFps = 0) => {
   data.append('skin_finishing_enabled', formChecked('skin-finishing')); data.append('skin_evenness', formValue('skin-evenness')); data.append('skin_smoothing', formValue('skin-smoothing')); data.append('skin_redness', formValue('skin-redness')); data.append('skin_shine', formValue('skin-shine')); data.append('blemish_mode', formValue('blemish-mode')); data.append('preserve_marks', formChecked('preserve-marks'));
   data.append('seam_mode', $('#seam-enabled').checked ? 'match' : 'off'); data.append('seam_frames', '2'); data.append('decoder_mode', 'optimized_fast');
   data.append('source_fps', String(sourceFps || 0));
+  const tensorRT = formValue('backend').includes('TensorRT');
+  data.append('gpu_finishing', tensorRT && !$('#gpu-finishing').disabled ? formChecked('gpu-finishing') : 'false');
+  data.append('warm_worker', tensorRT && !$('#warm-worker').disabled ? formChecked('warm-worker') : 'false');
+  data.append('scene_cut_detection', tensorRT && !$('#scene-cut-detection').disabled ? formChecked('scene-cut-detection') : 'false');
+  data.append('export_preset', tensorRT && !$('#export-preset').disabled ? formValue('export-preset') : 'software_h264');
   return data;
 };
 const requestSourceFps = () => {
@@ -183,19 +203,47 @@ const requestSourceFps = () => {
   }
 };
 
-const setRenderBusy = (busy) => { ['render-preview','render-full','reprocess-post'].forEach((id) => { $( `#${id}` ).disabled = busy; }); $('#stop-render').hidden = !busy; if (busy) { $('#resume-render').hidden = true; lastFailedJob = null; } };
+const setRenderBusy = (busy) => { renderBusy = busy; $('#recommend-settings').disabled = busy || recommendingSettings || window.__seedvrFeatures?.hardware_recommendations !== true; ['render-preview','render-full','reprocess-post'].forEach((id) => { $( `#${id}` ).disabled = busy; }); $('#stop-render').hidden = !busy; if (busy) { $('#performance-report').hidden = true; $('#resume-render').hidden = true; lastFailedJob = null; } };
 const pollJob = async (id, token = projectToken) => {
   const job = await (await fetch(`/api/jobs/${id}`)).json();
   if (token !== projectToken) return;
   window.__seedvrProgress = Number(job.progress) || 0;
   updateEta(window.__seedvrProgress);
   $('#render-status').textContent = `${job.message || job.status}${job.progress != null ? ` · ${Math.round(job.progress * 100)}%` : ''}`;
-  if (job.status === 'complete') { stopElapsed(job.elapsed_seconds); setRenderBusy(false); activeJob = null; if (Number(job.fps) > 0) fps = Number(job.fps); if (job.original_url) loadVideo(before, job.original_url); if (job.restored_url) loadVideo(after, job.restored_url); currentOutputPath = job.output_relative || ''; currentOutputReprocessable = Boolean(job.reprocessable); $('#reprocess-post').hidden = !currentOutputReprocessable; $('#open-output-folder').hidden = !currentOutputPath; $('#media-info').textContent = job.job_type === 'reprocess' ? 'Post-only reprocess complete' : `${job.job_type} complete`; loadOutputs(); return; }
-  if (job.status === 'error' || job.status === 'cancelled') { stopElapsed(job.elapsed_seconds); setRenderBusy(false); activeJob = null; if (job.status === 'error' && job.failure_code === 'fps_required') { const enteredFps = requestSourceFps(); if (enteredFps !== null) startRender(job.job_type, enteredFps); else $('#render-status').textContent = 'Render cancelled · source frame rate is required'; return; } lastFailedJob = job.resumable ? job.id : null; $('#resume-render').hidden = !lastFailedJob; $('#render-status').textContent = `${job.failure_reason || job.error || job.message || job.status}${job.log_file ? ' · log saved' : ''}`; return; }
+  if (job.status === 'complete') { stopElapsed(job.elapsed_seconds); setRenderBusy(false); activeJob = null; lastProfileJob = job.id; $('#performance-report').hidden = false; if (Number(job.fps) > 0) fps = Number(job.fps); if (job.original_url) loadVideo(before, job.original_url); if (job.restored_url) loadVideo(after, job.restored_url); currentOutputPath = job.output_relative || ''; currentOutputReprocessable = Boolean(job.reprocessable); $('#reprocess-post').hidden = !currentOutputReprocessable; $('#open-output-folder').hidden = !currentOutputPath; $('#media-info').textContent = job.job_type === 'reprocess' ? 'Post-only reprocess complete' : `${job.job_type} complete`; loadOutputs(); return; }
+  if (job.status === 'error' || job.status === 'cancelled') {
+    stopElapsed(job.elapsed_seconds); setRenderBusy(false); activeJob = null;
+    lastProfileJob = job.id; $('#performance-report').hidden = false;
+    if (job.status === 'error' && job.failure_code === 'fps_required') {
+      const enteredFps = requestSourceFps();
+      if (enteredFps !== null) startRender(job.job_type, enteredFps);
+      else $('#render-status').textContent = 'Render cancelled · source frame rate is required';
+      return;
+    }
+    lastFailedJob = job.resumable ? job.id : null; $('#resume-render').hidden = !lastFailedJob;
+    $('#render-status').textContent = `${job.failure_reason || job.error || job.message || job.status}${job.log_file ? ' · log saved' : ''}`;
+    return;
+  }
   setTimeout(() => pollJob(id, token).catch((error) => { if (token !== projectToken) return; setRenderBusy(false); $('#render-status').textContent = error.message; }), 800);
 };
 const startRender = async (type, sourceFps = 0) => { try { setRenderBusy(true); $('#render-status').textContent = `Uploading ${type}…`; const response = await fetch('/api/jobs', { method:'POST', body:renderForm(type, sourceFps) }); if (!response.ok) throw new Error(await response.text()); activeJob = (await response.json()).id; startElapsed(); pollJob(activeJob, projectToken); } catch (error) { stopElapsed(0); setRenderBusy(false); $('#render-status').textContent = error.message; } };
-const startReprocess = async () => { try { if (!currentOutputPath || !currentOutputReprocessable) throw new Error('Load a TensorRT result with saved decoded batches first.'); const data = new FormData(); data.append('output_path', currentOutputPath); data.append('seed', formValue('seed')); data.append('sharpen_enabled', formChecked('sharpen')); data.append('sharpen_strength', formValue('sharpen-strength')); data.append('microtexture_enabled', $('#skin-finishing').checked ? formChecked('microtexture') : 'false'); data.append('microtexture_strength', formValue('microtexture-strength')); data.append('skin_finishing_enabled', formChecked('skin-finishing')); data.append('skin_evenness', formValue('skin-evenness')); data.append('skin_smoothing', formValue('skin-smoothing')); data.append('skin_redness', formValue('skin-redness')); data.append('skin_shine', formValue('skin-shine')); data.append('blemish_mode', formValue('blemish-mode')); data.append('preserve_marks', formChecked('preserve-marks')); data.append('grain_enabled', formChecked('grain')); data.append('grain_intensity', formValue('grain-intensity')); data.append('grain_saturation', formValue('grain-saturation')); data.append('seam_mode', $('#seam-enabled').checked ? 'match' : 'off'); data.append('seam_frames', '2'); setRenderBusy(true); $('#render-status').textContent = 'Starting post-only reprocess…'; const response = await fetch('/api/reprocess', {method:'POST', body:data}); if (!response.ok) throw new Error(await response.text()); activeJob = (await response.json()).id; startElapsed(); pollJob(activeJob, projectToken); } catch (error) { stopElapsed(0); setRenderBusy(false); $('#render-status').textContent = error.message; } };
+const startReprocess = async () => {
+  try {
+    if (!currentOutputPath || !currentOutputReprocessable) throw new Error('Load a TensorRT result with saved decoded batches first.');
+    const data = new FormData();
+    data.append('output_path', currentOutputPath); data.append('seed', formValue('seed'));
+    [['sharpen', 'sharpen_enabled'], ['skin-finishing', 'skin_finishing_enabled'], ['preserve-marks', 'preserve_marks'], ['grain', 'grain_enabled']].forEach(([id, key]) => data.append(key, formChecked(id)));
+    ['sharpen-strength', 'microtexture-strength', 'skin-evenness', 'skin-smoothing', 'skin-redness', 'skin-shine', 'blemish-mode', 'grain-intensity', 'grain-saturation'].forEach((id) => data.append(id.replaceAll('-', '_'), formValue(id)));
+    data.append('microtexture_enabled', $('#skin-finishing').checked ? formChecked('microtexture') : 'false');
+    data.append('seam_mode', $('#seam-enabled').checked ? 'match' : 'off'); data.append('seam_frames', '2');
+    data.append('scene_cut_detection', !$('#scene-cut-detection').disabled ? formChecked('scene-cut-detection') : 'false');
+    data.append('export_preset', !$('#export-preset').disabled ? formValue('export-preset') : 'software_h264');
+    setRenderBusy(true); $('#render-status').textContent = 'Starting post-only reprocess…';
+    const response = await fetch('/api/reprocess', {method:'POST', body:data});
+    if (!response.ok) throw new Error(await response.text());
+    activeJob = (await response.json()).id; startElapsed(); pollJob(activeJob, projectToken);
+  } catch (error) { stopElapsed(0); setRenderBusy(false); $('#render-status').textContent = error.message; }
+};
 $('#render-preview').addEventListener('click', () => startRender('preview')); $('#render-full').addEventListener('click', () => startRender('full'));
 $('#reprocess-post').addEventListener('click', startReprocess);
 $('#resume-render').addEventListener('click', async () => { if (!lastFailedJob) return; try { $('#resume-render').hidden = true; setRenderBusy(true); const response = await fetch(`/api/jobs/${lastFailedJob}/resume`, {method:'POST'}); if (!response.ok) throw new Error(await response.text()); activeJob = lastFailedJob; startElapsed(); pollJob(activeJob, projectToken); } catch (error) { setRenderBusy(false); $('#render-status').textContent = error.message; } });
@@ -213,9 +261,115 @@ bindSliderValue('grain-saturation', 'grain-saturation-value', 2);
 const fillSelect = (id, values) => { const select = $(`#${id}`); select.innerHTML = ''; values.forEach((value) => { const option = document.createElement('option'); option.value = value; option.textContent = value; select.append(option); }); };
 const defaultBatchSizes = {'SeedVR2 + TensorRT': [5, 21], 'SeedVR2 (Legacy)': [1, 5, 9, 13, 17, 21, 33, 45]};
 const updateBatchOptions = (backend, preferred = null) => { const values = (window.__seedvrBatchSizes?.[backend] || defaultBatchSizes[backend] || defaultBatchSizes['SeedVR2 (Legacy)']).map(String); const select = $('#batch-size'); const current = preferred == null ? select.value : String(preferred); select.innerHTML = ''; values.forEach((value) => { const option = document.createElement('option'); option.value = value; option.textContent = value; select.append(option); }); select.value = values.includes(current) ? current : (values.includes('21') ? '21' : values[0]); $('#batch-note').textContent = backend === 'SeedVR2 + TensorRT' ? 'TensorRT supports temporal batches 5 and 21.' : 'SeedVR2 (Legacy) supports 4n+1 temporal batch sizes.'; };
+const applyHardwareSettings = (settings) => {
+  // Validate before changing anything, including when a newer UI meets an older server.
+  ['model', 'attention'].forEach((id) => {
+    if (!Array.from($(`#${id}`).options).some((option) => option.value === settings[id])) throw new Error('Recommended settings are unavailable in this UI. Restart Studio and try again.');
+  });
+  const batches = window.__seedvrBatchSizes?.[$('#backend').value] || defaultBatchSizes[$('#backend').value];
+  if (!batches.map(Number).includes(Number(settings.batch_size))) throw new Error('Recommended temporal batch is unsupported by this render engine.');
+  if (!Number.isInteger(settings.blocks) || settings.blocks < Number($('#blocks').min) || settings.blocks > Number($('#blocks').max) || typeof settings.vae_tiling !== 'boolean') throw new Error('Recommended memory settings are invalid. Restart Studio and try again.');
+  $('#model').value = settings.model; $('#attention').value = settings.attention;
+  updateBatchOptions($('#backend').value, settings.batch_size);
+  $('#blocks').value = settings.blocks; $('#vae-tiling').checked = Boolean(settings.vae_tiling);
+  refreshSettingsUi();
+};
+const hardwareDialog = $('#hardware-dialog');
+let pendingHardwareRecommendation = null, hardwareRequestId = 0;
+const hardwareContext = () => {
+  const params = new URLSearchParams({backend_name: $('#backend').value, output_preset: $('#output-preset').value,
+    source_width: String(before.videoWidth || 0), source_height: String(before.videoHeight || 0)});
+  return {params, key: `${projectToken}:${params}`};
+};
+const describeHardware = (hardware) => {
+  const gib = (bytes) => bytes == null ? 'unknown' : `${(Number(bytes) / 1024 ** 3).toFixed(1)} GiB`;
+  const parts = [];
+  if (hardware.gpu_name) parts.push(`${hardware.gpu_name} (${hardware.device})`, `VRAM: ${gib(hardware.total_vram_bytes)} total / ${gib(hardware.free_vram_bytes)} free`);
+  if (hardware.total_ram_bytes != null) parts.push(`System RAM: ${gib(hardware.total_ram_bytes)} total / ${gib(hardware.available_ram_bytes)} free`);
+  if (hardware.cpu_threads) parts.push(`${hardware.cpu_threads} CPU threads`);
+  return parts.join(' · ');
+};
+$('#recommend-settings').addEventListener('click', async () => {
+  const context = hardwareContext();
+  const requestId = ++hardwareRequestId;
+  pendingHardwareRecommendation = null; recommendingSettings = true; refreshSettingsUi();
+  $('#hardware-message').textContent = 'Inspecting hardware…'; $('#hardware-summary').textContent = '';
+  $('#hardware-settings').replaceChildren(); $('#hardware-notes').replaceChildren(); $('#hardware-apply').disabled = true;
+  hardwareDialog.showModal();
+  try {
+    const response = await fetch(`/api/hardware/recommendation?${context.params}`, {cache:'no-store'});
+    if (!response.ok) throw new Error(response.status === 404 ? 'Restart Studio to enable hardware recommendations.' : 'Could not inspect hardware. Please try again.');
+    const recommendation = await response.json();
+    if (requestId !== hardwareRequestId || !hardwareDialog.open) return;
+    $('#hardware-message').textContent = recommendation.message;
+    $('#hardware-summary').textContent = describeHardware(recommendation.hardware || {});
+    (recommendation.notes || []).forEach((note) => { const item = document.createElement('li'); item.textContent = note; $('#hardware-notes').append(item); });
+    if (recommendation.available && recommendation.settings) {
+      const settings = recommendation.settings;
+      [['Model', settings.model], ['Temporal batch', settings.batch_size], ['Attention', settings.attention],
+        ['Blocks to swap', settings.blocks], ['VAE tiling', settings.vae_tiling ? 'On' : 'Off']].forEach(([label, value]) => {
+        const term = document.createElement('dt'); term.textContent = label;
+        const detail = document.createElement('dd'); detail.textContent = String(value); $('#hardware-settings').append(term, detail);
+      });
+      pendingHardwareRecommendation = {settings, context: context.key}; $('#hardware-apply').disabled = false;
+    }
+  } catch (error) {
+    if (requestId === hardwareRequestId && hardwareDialog.open) $('#hardware-message').textContent = `${error.message} Your settings have not changed.`;
+  } finally { recommendingSettings = false; refreshSettingsUi(); }
+});
+hardwareDialog.addEventListener('close', () => {
+  // A queued close event from the previous review must not discard a new one.
+  if (!hardwareDialog.open) { pendingHardwareRecommendation = null; hardwareRequestId += 1; }
+});
+$('#hardware-apply').addEventListener('click', () => {
+  if (!pendingHardwareRecommendation) return;
+  if (renderBusy || pendingHardwareRecommendation.context !== hardwareContext().key) {
+    $('#hardware-message').textContent = 'The source or render settings changed. Close this dialog and request a fresh recommendation.';
+    $('#hardware-apply').disabled = true; return;
+  }
+  try {
+    applyHardwareSettings(pendingHardwareRecommendation.settings); $('#preset').value = 'Custom / manual';
+    $('#hardware-status').textContent = 'Recommendation applied — test a short preview before a full render.';
+    $('#settings-save-status').textContent = 'Recommendation applied — not saved yet'; hardwareDialog.close();
+  } catch (error) { $('#hardware-message').textContent = error.message; }
+});
 $('#backend').addEventListener('change', () => { updateBatchOptions($('#backend').value); refreshSettingsUi(); });
 const setSkinBackendAvailable = (available) => { $('#skin-backend-warning').hidden = available; $('#skin-finishing').disabled = !available; if (!available) $('#skin-finishing').checked = false; refreshSettingsUi(); };
-const loadConfig = async () => { try { const config = await (await fetch('/api/config')).json(); window.__seedvrBatchSizes = config.batch_sizes || defaultBatchSizes; fillSelect('model', config.models); fillSelect('preset', Object.keys(config.presets)); fillSelect('output-preset', Object.keys(config.output_presets)); fillSelect('crop-policy', config.crop_policies); const saved = loadSavedSettings(); const savedBackend = String(saved?.values?.backend || 'SeedVR2 + TensorRT'); const backendAliases = {'TensorRT VAE (experimental)':'SeedVR2 + TensorRT', 'SeedVR2 AI':'SeedVR2 (Legacy)'}; const requestedBackend = backendAliases[savedBackend] || savedBackend; $('#backend').value = Array.from($('#backend').options).some((option) => option.value === requestedBackend) ? requestedBackend : 'SeedVR2 + TensorRT'; updateBatchOptions($('#backend').value); $('#output-preset').value = '1K / 1080p'; $('#crop-policy').value = 'Preserve original aspect ratio'; if (config.seam_modes) { $('#seam-enabled').disabled = false; $('#seam-enabled').title = 'Color + noise match over 2 frames'; } else { $('#seam-enabled').title = 'Available after the JS backend is restarted'; } const preset = $('#preset'); preset.addEventListener('change', () => { const value = config.presets[preset.value]; if (!value) return; ['model','batch-size','attention','blocks'].forEach((id) => { const key = {'batch-size':'batch_size','model':'model','attention':'attention','blocks':'blocks'}[id]; if (value[key] != null) $(`#${id}`).value = value[key]; }); updateBatchOptions($('#backend').value, value.batch_size); $('#vae-tiling').checked = Boolean(value.vae_tiling); $('#blocks-value').textContent = $('#blocks').value; }); restoreSettings(); updateBatchOptions($('#backend').value, $('#batch-size').value); setSkinBackendAvailable(config.features?.skin_finishing === true); const backend = config.backend; $('#api-status').textContent = backend.seedvr?.message || 'API ready'; } catch (_) { $('#backend').value = 'SeedVR2 + TensorRT'; updateBatchOptions($('#backend').value); restoreSettings(); if (!$('#backend').value) $('#backend').value = 'SeedVR2 + TensorRT'; updateBatchOptions($('#backend').value, $('#batch-size').value); setSkinBackendAvailable(false); $('#api-status').textContent = 'API ready · config unavailable'; } };loadConfig();
+const loadConfig = async () => {
+  try {
+    const config = await (await fetch('/api/config')).json();
+    window.__seedvrBatchSizes = config.batch_sizes || defaultBatchSizes;
+    window.__seedvrFeatures = config.features || {};
+    window.__seedvrExportAvailable = Boolean(config.export_presets);
+    fillSelect('model', config.models); fillSelect('preset', Object.keys(config.presets));
+    fillSelect('output-preset', Object.keys(config.output_presets)); fillSelect('crop-policy', config.crop_policies);
+    const saved = loadSavedSettings();
+    const savedBackend = String(saved?.values?.backend || 'SeedVR2 + TensorRT');
+    const backendAliases = {'TensorRT VAE (experimental)':'SeedVR2 + TensorRT', 'SeedVR2 AI':'SeedVR2 (Legacy)'};
+    const requestedBackend = backendAliases[savedBackend] || savedBackend;
+    $('#backend').value = Array.from($('#backend').options).some((option) => option.value === requestedBackend) ? requestedBackend : 'SeedVR2 + TensorRT';
+    updateBatchOptions($('#backend').value); $('#output-preset').value = '1K / 1080p'; $('#crop-policy').value = 'Preserve original aspect ratio';
+    if (config.seam_modes) {
+      $('#seam-enabled').disabled = false; $('#seam-enabled').title = 'Color + noise match over 2 frames';
+    } else { $('#seam-enabled').title = 'Available after the JS backend is restarted'; }
+    const preset = $('#preset');
+    preset.addEventListener('change', () => {
+      const value = config.presets[preset.value];
+      if (!value) return;
+      applyHardwareSettings(value); $('#hardware-status').textContent = 'Manual hardware preset applied.';
+    });
+    restoreSettings(); updateBatchOptions($('#backend').value, $('#batch-size').value);
+    setSkinBackendAvailable(config.features?.skin_finishing === true);
+    $('#api-status').textContent = config.backend.seedvr?.message || 'API ready';
+  } catch (_) {
+    window.__seedvrFeatures = {}; window.__seedvrExportAvailable = false;
+    $('#backend').value = 'SeedVR2 + TensorRT'; updateBatchOptions($('#backend').value); restoreSettings();
+    if (!$('#backend').value) $('#backend').value = 'SeedVR2 + TensorRT';
+    updateBatchOptions($('#backend').value, $('#batch-size').value); setSkinBackendAvailable(false);
+    $('#api-status').textContent = 'API ready · config unavailable';
+  }
+};
+loadConfig();
 
 
 

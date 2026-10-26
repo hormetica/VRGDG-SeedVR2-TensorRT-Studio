@@ -1,3 +1,4 @@
+# Modified by SeedVR Studio: GPU-generation checks and attention-dispatch profiling.
 """
 Compatibility module for SeedVR2
 Contains FP8/FP16 compatibility layers and wrappers for different model architectures
@@ -9,6 +10,10 @@ Extracted from: seedvr2.py (lines 1045-1630)
 import sys
 import types
 import importlib.machinery
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..utils.debug import Debug
 
 
 def ensure_triton_compat():
@@ -171,6 +176,16 @@ except (ImportError, AttributeError, OSError):
 
 SAGE_ATTN_AVAILABLE = SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
 
+# Studio instrumentation: count actually dispatched kernels, including SA3's
+# runtime SA2 fallback. No CUDA synchronization or tensor inspection is added.
+ATTENTION_BACKENDS_USED = {}
+
+
+@torch._dynamo.disable
+def record_attention_backend(name):
+    if os.environ.get("SEEDVR2_PROFILE_PATH"):
+        ATTENTION_BACKENDS_USED[name] = ATTENTION_BACKENDS_USED.get(name, 0) + 1
+
 
 def validate_attention_mode(requested_mode: str, debug=None) -> str:
     """
@@ -183,9 +198,13 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     Returns:
         Validated mode that is available
     """
+    # Importability alone does not imply the installed GPU supports a backend.
+    capability = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+    fa3_supported = FLASH_ATTN_3_AVAILABLE and capability >= 9
+    sa3_supported = SAGE_ATTN_3_AVAILABLE and capability >= 10
     # Flash Attention 3
     if requested_mode == 'flash_attn_3':
-        if FLASH_ATTN_3_AVAILABLE:
+        if fa3_supported:
             return requested_mode
         if FLASH_ATTN_2_AVAILABLE:
             if debug:
@@ -233,7 +252,7 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     
     # SageAttention 3 (Blackwell)
     if requested_mode == 'sageattn_3':
-        if SAGE_ATTN_3_AVAILABLE:
+        if sa3_supported:
             return requested_mode
         if SAGE_ATTN_2_AVAILABLE:
             if debug:
@@ -243,7 +262,7 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
                     level="WARNING", category="setup", force=True
                 )
             return 'sageattn_2'
-        if FLASH_ATTN_3_AVAILABLE:
+        if fa3_supported:
             if debug:
                 debug.log("SageAttention is unavailable. Falling back to Flash Attention 3.", level="WARNING", category="setup", force=True)
             return 'flash_attn_3'
@@ -272,11 +291,11 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
     if requested_mode == 'sageattn_2':
         if SAGE_ATTN_2_AVAILABLE:
             return requested_mode
-        if SAGE_ATTN_3_AVAILABLE:
+        if sa3_supported:
             if debug:
                 debug.log("SageAttention 2 is unavailable. Falling back to SageAttention 3.", level="WARNING", category="setup", force=True)
             return 'sageattn_3'
-        if FLASH_ATTN_3_AVAILABLE:
+        if fa3_supported:
             if debug:
                 debug.log("SageAttention is unavailable. Falling back to Flash Attention 3.", level="WARNING", category="setup", force=True)
             return 'flash_attn_3'
@@ -338,7 +357,7 @@ def call_flash_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     if torch.is_tensor(max_seqlen_k):
         max_seqlen_k = int(max_seqlen_k.item())
     
-    return flash_attn_2_varlen_func(
+    out = flash_attn_2_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -348,6 +367,8 @@ def call_flash_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
         max_seqlen_k=max_seqlen_k,
         **kwargs
     )
+    record_attention_backend("flash_attn_2")
+    return out
 
 
 @torch._dynamo.disable
@@ -390,7 +411,7 @@ def call_flash_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
     fa3_kwargs = {key: val for key, val in kwargs.items() if key not in ('dropout_p', 'window_size')}
     
     # FA3 returns a tuple (output, softmax_lse), we only need output
-    return flash_attn_3_varlen_func(
+    out = flash_attn_3_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -402,6 +423,8 @@ def call_flash_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
         seqused_k=None,
         **fa3_kwargs
     )[0]
+    record_attention_backend("flash_attn_3")
+    return out
 
 
 @torch._dynamo.disable
@@ -461,6 +484,7 @@ def call_sage_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
         max_seqlen_q, max_seqlen_k,
         is_causal, sm_scale
     )
+    record_attention_backend("sageattn_2")
     
     return out.to(out_dtype) if out.dtype != out_dtype else out
 
@@ -558,6 +582,7 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     
     # Call SA3 Blackwell
     out = sageattn_blackwell(q_batched, k_batched, v_batched, per_block_mean=False)
+    record_attention_backend("sageattn_3")
     
     # Reshape back to varlen format (total_seq, heads, dim)
     out = out.transpose(1, 2).reshape(-1, heads, dim).contiguous()

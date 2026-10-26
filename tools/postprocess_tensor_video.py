@@ -139,6 +139,66 @@ def apply_skin_microtexture(video: torch.Tensor, strength: float) -> torch.Tenso
     return video
 
 
+@torch.inference_mode()
+def apply_postprocessing(
+    video: torch.Tensor,
+    *,
+    sharpen_strength: float = 0.0,
+    grain_intensity: float = 0.0,
+    grain_saturation: float = 0.5,
+    microtexture_strength: float = 0.0,
+    skin_evenness: float = 0.0,
+    skin_smoothing: float = 0.0,
+    skin_redness: float = 0.0,
+    skin_shine: float = 0.0,
+    blemish_mode: str = "off",
+    preserve_marks: bool = False,
+    seed: int = 42,
+    frame_start: int = 0,
+    device: str = "cuda",
+    output_device: str = "cpu",
+) -> torch.Tensor:
+    """Finish one batch, returning CPU FP16 pixels in decoder range.
+
+    Keep the padded frames until after effects: temporal skin masks need that
+    context. Both the standalone tool and the streaming assembler use this
+    implementation, including the same per-frame grain seeds.
+    """
+    video = video.to(device=device, dtype=torch.float32, non_blocking=True)
+    # Decoder output is [-1, 1], while the effects operate in [0, 1].
+    x = ((video.clamp(-1, 1) + 1.0) * 0.5)
+    x = apply_skin_finishing(x, skin_evenness, skin_smoothing, skin_redness,
+                             skin_shine, blemish_mode, preserve_marks)
+    x = apply_skin_microtexture(x, microtexture_strength)
+    sharpen = max(0.0, min(10.0, float(sharpen_strength)))
+    if sharpen > 0:
+        b, c, t, h, w = x.shape
+        spatial = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        blurred = F.avg_pool2d(spatial, kernel_size=3, stride=1, padding=1)
+        spatial = (spatial + sharpen * (spatial - blurred)).clamp(0, 1)
+        x = spatial.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+    intensity = max(0.0, min(1.0, float(grain_intensity)))
+    if intensity > 0:
+        saturation = max(0.0, min(1.0, float(grain_saturation)))
+        for offset in range(x.shape[2]):
+            generator = torch.Generator(device=x.device)
+            generator.manual_seed((int(seed) + int(frame_start) + offset) & 0x7FFFFFFF)
+            noise = torch.randn((x.shape[0], 1, x.shape[3], x.shape[4]), generator=generator,
+                                device=x.device, dtype=x.dtype)
+            # Mild chroma variation, matching the film-grain behavior used by
+            # the reference tool while remaining stable across batch boundaries.
+            colored = noise.repeat(1, 3, 1, 1)
+            colored[:, 0] *= 2.0
+            colored[:, 2] *= 3.0
+            gray = colored[:, 1:2]
+            grain = saturation * colored + (1.0 - saturation) * gray
+            # Keep only one frame's noise live. Separate multiply/add kernels
+            # preserve the original stacked implementation's rounding order.
+            grain.mul_(intensity)
+            x[:, :, offset].add_(grain).clamp_(0, 1)
+    return (x * 2.0 - 1.0).to(dtype=torch.float16).to(output_device)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
@@ -158,42 +218,11 @@ def main() -> None:
     args = parser.parse_args()
 
     payload = torch.load(args.input, map_location="cpu", weights_only=False)
-    if isinstance(payload, dict) and "video" in payload:
-        video = payload["video"]
-    else:
-        video = payload
-        payload = {"video": video}
-    video = video.to(device="cuda", dtype=torch.float32, non_blocking=True)
-    # Decoder output is [-1, 1], while the effects operate in [0, 1].
-    x = ((video.clamp(-1, 1) + 1.0) * 0.5)
-    x = apply_skin_finishing(x, args.skin_evenness, args.skin_smoothing, args.skin_redness,
-                             args.skin_shine, args.blemish_mode, args.preserve_marks)
-    x = apply_skin_microtexture(x, args.microtexture_strength)
-    sharpen = max(0.0, min(10.0, float(args.sharpen_strength)))
-    if sharpen > 0:
-        b, c, t, h, w = x.shape
-        spatial = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-        blurred = F.avg_pool2d(spatial, kernel_size=3, stride=1, padding=1)
-        spatial = (spatial + sharpen * (spatial - blurred)).clamp(0, 1)
-        x = spatial.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
-    intensity = max(0.0, min(1.0, float(args.grain_intensity)))
-    if intensity > 0:
-        saturation = max(0.0, min(1.0, float(args.grain_saturation)))
-        frames = []
-        for offset in range(x.shape[2]):
-            generator = torch.Generator(device="cuda")
-            generator.manual_seed((int(args.seed) + int(args.frame_start) + offset) & 0x7FFFFFFF)
-            noise = torch.randn((x.shape[0], 1, x.shape[3], x.shape[4]), generator=generator,
-                                device=x.device, dtype=x.dtype)
-            # Mild chroma variation, matching the film-grain behavior used by
-            # the reference tool while remaining stable across batch boundaries.
-            colored = noise.repeat(1, 3, 1, 1)
-            colored[:, 0] *= 2.0
-            colored[:, 2] *= 3.0
-            gray = colored[:, 1:2].repeat(1, 3, 1, 1)
-            frames.append(saturation * colored + (1.0 - saturation) * gray)
-        x = (x + torch.stack(frames, dim=2) * intensity).clamp(0, 1)
-    payload["video"] = (x * 2.0 - 1.0).to(dtype=torch.float16).cpu()
+    if not isinstance(payload, dict):
+        payload = {"video": payload}
+    options = vars(args).copy()
+    del options["input"], options["output"]
+    payload["video"] = apply_postprocessing(payload["video"], **options)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, args.output)
     print(f"Saved: {args.output}")

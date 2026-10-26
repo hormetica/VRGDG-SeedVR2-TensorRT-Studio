@@ -13,12 +13,13 @@
 # // limitations under the License.
 
 import torch
+# Modified by SeedVR Studio: records actual attention dispatch for stage reports.
 import torch.nn.functional as F
 
 # Import flash/sage attn with automatic fallback from compatibility layer
 from ...optimization.compatibility import (
     call_flash_attn_2_varlen, call_flash_attn_3_varlen,
-    call_sage_attn_2_varlen, call_sage_attn_3_varlen
+    call_sage_attn_2_varlen, call_sage_attn_3_varlen, record_attention_backend
 )
 
 from torch import nn
@@ -74,6 +75,7 @@ class TorchAttention(nn.Module):
         return b * h * (4 * d * (sq / 1e6) * (sk / 1e6))
 
     def forward(self, *args, **kwargs):
+        record_attention_backend("sdpa")
         return F.scaled_dot_product_attention(*args, **kwargs)
 
 
@@ -142,6 +144,7 @@ class FlashAttentionVarlen(nn.Module):
             )
         else:
             # PyTorch SDPA
+            record_attention_backend("sdpa")
             return pytorch_varlen_attention(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, **kwargs

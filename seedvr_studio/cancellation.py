@@ -7,7 +7,6 @@ import psutil
 
 from .paths import ROOT, SEEDVR_CLI
 
-
 _CANCEL_REQUESTED = Event()
 
 def begin_render() -> None:
@@ -21,7 +20,8 @@ def cancel_current_render() -> str:
     """Terminate only SeedVR2 inference processes launched by this workspace."""
     _CANCEL_REQUESTED.set()
     render_paths = [str(SEEDVR_CLI).lower()] + [str(ROOT / "tools" / name).lower() for name in (
-        "run_tensorrt_tiled.py", "run_tensorrt_persistent.py", "postprocess_tensor_video.py", "assemble_tensor_video.py"
+        "run_tensorrt_tiled.py", "run_tensorrt_persistent.py", "postprocess_tensor_video.py", "assemble_tensor_video.py",
+        "run_seedvr_worker.py",
     )]
     targets: dict[int, psutil.Process] = {}
 

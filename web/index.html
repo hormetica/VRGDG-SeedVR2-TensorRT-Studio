@@ -4,14 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SeedVR Studio · Beta</title>
-  <link rel="stylesheet" href="/styles.css?v=20260830-7">
+  <link rel="stylesheet" href="/styles.css?v=20261025-images-1">
 </head>
 <body>
   <header class="appbar">
     <div class="brand"><span class="brand-mark">S</span><span>SeedVR <em>Studio</em></span><small>Beta</small></div>
+    <nav class="workflow-tabs" aria-label="Media workflow"><button id="video-tab" class="active" type="button" aria-pressed="true">Videos</button><button id="images-tab" type="button" aria-pressed="false">Images</button></nav>
     <div class="connection"><span class="status-dot" id="api-dot"></span><span id="api-status">Connecting…</span></div>
   </header>
-  <main class="workspace">
+  <main class="workspace" id="video-workspace">
     <aside class="control-rail">
       <section class="rail-card source-card">
         <div class="section-kicker">MEDIA</div>
@@ -29,6 +30,8 @@
         <div class="section-kicker">RENDER ENGINE</div>
         <div class="engine-select-row"><select id="backend"><option selected>SeedVR2 + TensorRT</option><option>SeedVR2 (Legacy)</option></select><button class="help-button" id="engine-help" type="button" title="About the render engines">?</button></div>
         <div class="field-label">Hardware preset</div><select id="preset"><option>Custom / manual</option></select>
+        <button class="secondary-button" id="recommend-settings" type="button" disabled>Recommend settings</button>
+        <p class="media-note" id="hardware-status" role="status">Inspect your GPU and available memory, then review settings before applying.</p>
         <div class="field-label">Output size</div><select id="output-preset"><option>Original / enhancement only</option><option selected>1K / 1080p</option><option>2K / 1440p</option><option>4K / 2160p</option></select>
         <div class="field-label">Crop / aspect policy</div><select id="crop-policy"><option>Preserve original aspect ratio</option><option>Center crop to 16:9</option></select>
         <label class="check chunk-toggle"><input id="chunked-render" type="checkbox"> Resumable long-video render <button class="help-button" id="chunk-help" type="button" title="How resumable rendering works">?</button></label>
@@ -36,7 +39,19 @@
         <div class="field-label">Model</div><select id="model"><option>3B FP16 — best 3B quality</option></select>
         <div class="field-grid"><label>Temporal batch<select id="batch-size"><option>1</option><option>5</option><option>9</option><option>13</option><option>17</option><option selected>21</option><option>33</option><option>45</option></select></label><label>Seed<input id="seed" type="number" value="42"></label></div><p class="media-note" id="batch-note">TensorRT supports temporal batches 5 and 21.</p>
         <div class="field-label">Color correction</div><select id="color"><option>lab</option><option>wavelet</option><option>wavelet_adaptive</option><option>hsv</option><option>adain</option><option selected>none</option></select>
-        <details><summary>Performance</summary><p class="media-note">TensorRT uses Optimized Fast decoding automatically. If it fails, saved latents retry with the internal Stable decoder.</p><div class="field-label">Attention</div><select id="attention" autocomplete="off"><option selected>sageattn_2</option><option>sageattn_3</option><option>flash_attn_3</option><option>flash_attn_2</option><option>sdpa</option></select><p class="media-note">SageAttention 2 is preferred. Missing accelerated backends automatically fall through to another installed option, then SDPA.</p><label class="range-label">Blocks to swap <output id="blocks-value">0</output><input id="blocks" type="range" min="0" max="36" value="0"></label><label class="check"><input id="vae-tiling" type="checkbox"> VAE tiling</label></details>
+        <details><summary>Performance</summary><p class="media-note">TensorRT uses Optimized Fast decoding automatically. If it fails, saved latents retry with the internal Stable decoder.</p><div class="field-label">Attention</div><select id="attention" autocomplete="off"><option selected>sageattn_2</option><option>sageattn_3</option><option>flash_attn_3</option><option>flash_attn_2</option><option>sdpa</option></select><p class="media-note">SageAttention 2 is preferred. Performance reports record the kernels actually used, including fallbacks.</p><label class="range-label">Blocks to swap <output id="blocks-value">0</output><input id="blocks" type="range" min="0" max="36" value="0"></label><label class="check"><input id="vae-tiling" type="checkbox"> VAE tiling</label>
+          <label class="check"><input id="gpu-finishing" type="checkbox"> GPU-resident decode + effects (Beta)</label>
+          <p class="media-note">Avoids reloading decoded batches. Raw recovery files are still saved. TensorRT only; falls back to the Stable path if it fails.</p>
+          <label class="check"><input id="warm-worker" type="checkbox"> Keep models warm in system RAM (Beta)</label>
+          <p class="media-note">Reuses one model selection between previews/chunks. Frees model VRAM before decoding and releases the CPU cache after 5 idle minutes. Requires enough free system RAM.</p>
+          <label class="check"><input id="scene-cut-detection" type="checkbox"> Protect scene cuts during seam smoothing</label>
+          <p class="media-note">Conservatively detects hard cuts and skips cross-shot color/noise matching. Off by default; flashes and similarly colored shots can be ambiguous.</p>
+        </details>
+        <details><summary>Export quality</summary>
+          <div class="field-label">Encoder</div><select id="export-preset"><option value="software_h264" selected>H.264 / CPU — original quality</option><option value="h264_nvenc">H.264 / NVIDIA — fast</option><option value="hevc_nvenc_10bit">HEVC / NVIDIA 10-bit</option><option value="av1_nvenc_10bit">AV1 / NVIDIA 10-bit</option></select>
+          <p class="media-note">New presets apply to TensorRT renders and post-only reprocessing. NVENC is tested before export; unavailable hardware falls back to a software encoder with the same codec family and bit depth. Quality values are not equivalent between encoders.</p>
+          <p class="media-note">10-bit SDR keeps floating-point precision until RGB48 conversion; it is not HDR. HEVC/AV1 may need an external player. H.264 remains the compatibility default.</p>
+        </details>
         <details><summary>Post-processing</summary><label class="check"><input id="sharpen" type="checkbox"> Extra sharpen</label><label class="range-label">Sharpen amount <output id="sharpen-strength-value">0.25</output><input id="sharpen-strength" type="range" min="0" max="10" step=".01" value=".25"></label><label class="check"><input id="grain" type="checkbox"> Film grain</label><label class="range-label">Grain intensity <output id="grain-intensity-value">0.020</output><input id="grain-intensity" type="range" min="0" max=".1" step=".001" value=".02"></label><label class="range-label">Grain saturation <output id="grain-saturation-value">0.50</output><input id="grain-saturation" type="range" min="0" max="1" step=".01" value=".5"></label><label class="check seam-toggle"><input id="seam-enabled" type="checkbox" checked disabled> Smooth TensorRT batch seams</label><p class="media-note">Uses the proven Color + noise match treatment over 2 frames at every decoded batch boundary.</p><p class="seam-warning" id="seam-warning" hidden>Warning: disabling seam smoothing can cause visible noise, color, or texture changes every temporal batch—for example, every 21 frames.</p></details>
         <details id="skin-finishing-panel"><summary>Skin finishing</summary><p class="feature-warning" id="skin-backend-warning" hidden>Restart SeedVR Studio to enable skin finishing. Refreshing the page alone cannot update the Python processing backend.</p><label class="check skin-master"><input id="skin-finishing" type="checkbox"> Enable skin finishing</label><div id="skin-options"><label class="range-label">Even skin tone <output id="skin-evenness-value">0.25</output><input id="skin-evenness" type="range" min="0" max="1" step=".05" value=".25"></label><label class="range-label">Skin smoothing <output id="skin-smoothing-value">0.20</output><input id="skin-smoothing" type="range" min="0" max="1" step=".05" value=".2"></label><label class="range-label">Redness reduction <output id="skin-redness-value">0.15</output><input id="skin-redness" type="range" min="0" max="1" step=".05" value=".15"></label><label class="range-label">Shine reduction <output id="skin-shine-value">0.15</output><input id="skin-shine" type="range" min="0" max="1" step=".05" value=".15"></label><div class="field-label">Blemish cleanup</div><select id="blemish-mode"><option value="off" selected>Off</option><option value="subtle">Subtle</option><option value="strong">Strong</option></select><label class="check"><input id="preserve-marks" type="checkbox" checked> Preserve freckles and moles</label><label class="check"><input id="microtexture" type="checkbox"> Face-aware microtexture</label><label class="range-label">Microtexture strength <output id="microtexture-strength-value">0.60</output><input id="microtexture-strength" type="range" min="0" max="3" step=".05" value=".6"></label></div><p class="media-note">Off by default. Uses a stabilized skin mask and protects strong facial contours. Blemish cleanup can still affect permanent marks; preview first.</p></details>
         <div class="settings-save"><button class="secondary-button" id="save-settings" type="button">Save current settings</button><span id="settings-save-status">Not saved yet</span></div>
@@ -65,10 +80,78 @@
         <div class="transport"><label>Frame <input id="frame" type="number" min="0" value="0"><span id="frame-total">/ 0</span></label><div class="transport-buttons"><button id="prev" title="Previous frame">|◀</button><button id="play" class="play-button" title="Play both">▶</button><button id="next" title="Next frame">▶|</button></div><label class="wipe-control">Wipe <input id="wipe" type="range" min="0" max="100" value="50"><span id="wipe-value">50%</span></label></div>
       </section>
       <section class="render-bar"><div class="preview-fields"><label>Preview start<input id="preview-start" type="number" min="0" step=".1" value="3"> sec</label><label>Length<input id="preview-seconds" type="number" min="1" max="10" step=".5" value="3"> sec</label></div><div class="render-actions"><button id="reprocess-post" class="secondary-button" hidden>Reprocess post only</button><button id="render-preview" class="secondary-button">Render preview</button><button id="render-full" class="primary-button">Render full video</button><button id="resume-render" class="secondary-button" hidden>Retry from last chunk</button><button id="stop-render" class="danger-button" hidden>Stop</button></div></section>
-      <div class="viewer-footer"><span id="media-info">No media loaded</span><button id="open-output-folder" class="footer-open-button" type="button" hidden>Open project folder</button></div>
+      <div class="viewer-footer"><span id="media-info">No media loaded</span><button id="performance-report" class="footer-open-button" type="button" hidden>Performance report</button><button id="open-output-folder" class="footer-open-button" type="button" hidden>Open project folder</button></div>
+    </section>
+  </main>
+  <main class="image-workspace" id="image-workspace" hidden>
+    <aside class="control-rail">
+      <section class="rail-card">
+        <div class="section-kicker">LOCAL IMAGES</div>
+        <p class="media-note">Pick images from Desktop, Downloads, or different folders. Originals stay untouched.</p>
+        <div class="image-button-row"><button id="image-add-files" class="secondary-button" type="button">Add images</button><button id="image-add-folder" class="secondary-button" type="button">Add folder</button></div>
+        <label class="field-label" for="image-source-path">Or enter a folder path</label>
+        <input id="image-source-path" class="path-input" type="text" placeholder="C:\Users\…\Desktop\Photos" autocomplete="off">
+        <button id="image-add-path" class="secondary-button" type="button">Add folder path</button>
+        <p class="media-note">JPG / JPEG / PNG · folder additions do not include subfolders.</p>
+      </section>
+      <section class="rail-card">
+        <div class="section-kicker">OUTPUT LOCATION</div>
+        <label class="field-label" for="image-output-root">Each batch gets a new folder here</label>
+        <input id="image-output-root" class="path-input" type="text" autocomplete="off" spellcheck="false">
+        <button id="image-browse-output" class="secondary-button" type="button">Choose output folder</button>
+        <label class="check image-check"><input id="image-create-root" type="checkbox"> Create output folder if missing</label>
+      </section>
+      <section class="rail-card settings-card">
+        <div class="section-kicker">SHARED IMAGE SETTINGS</div>
+        <label class="field-label" for="image-engine">Inference</label>
+        <select id="image-engine"><option value="auto">Auto · TensorRT, then SeedVR</option><option value="seedvr">SeedVR · compatibility</option><option value="tensorrt">TensorRT · no fallback</option></select>
+        <p class="media-note">Auto prefers TensorRT. The actual engine and any fallback are shown per image. No video frames or FPS to configure.</p>
+        <label class="field-label" for="image-model">Model</label><select id="image-model"></select>
+        <div class="field-grid"><label for="image-scale">Scale<select id="image-scale"><option value="1">1× · enhance</option><option value="2" selected>2×</option><option value="4">4×</option></select></label><label for="image-max-edge">Maximum edge<input id="image-max-edge" type="number" min="64" max="16384" step="1" value="4096"></label></div>
+        <p class="media-note">The maximum edge can limit the scale. Review shows each exact output size. PNG transparency is retained.</p>
+        <details><summary>Advanced</summary>
+          <label class="field-label" for="image-seed">Seed</label><input id="image-seed" type="number" min="0" max="4294967295" value="42">
+          <label class="field-label" for="image-attention">Attention</label><select id="image-attention"><option value="sdpa">sdpa · compatible</option><option>sageattn_2</option><option>sageattn_3</option><option>flash_attn_2</option><option>flash_attn_3</option></select>
+          <label class="field-label" for="image-blocks">Blocks to swap</label><input id="image-blocks" type="number" min="0" max="36" value="0">
+          <label class="check image-check"><input id="image-tiling" type="checkbox" checked> VAE tiling</label>
+          <p class="media-note">TensorRT restores five copies of each still independently and retains one frame; SeedVR uses one frame. Their appearance and speed can differ.</p>
+        </details>
+      </section>
+      <section class="rail-card"><div class="section-kicker">IMAGE HISTORY</div><label class="field-label" for="image-history">Includes custom output locations</label><select id="image-history"><option value="">No image batches yet</option></select><button id="image-load-history" class="secondary-button" type="button">Load image batch</button></section>
+    </aside>
+    <section class="image-column">
+      <div class="viewer-header"><div><span class="eyebrow">SEEDVR STUDIO</span><h1>Bulk image restoration and upscale</h1></div><div class="header-actions"><button id="image-exit" class="icon-button" title="Exit Studio and release GPU/RAM" aria-label="Exit Studio" type="button">⏻</button></div></div>
+      <section class="image-inspector" aria-label="Image comparison">
+        <div class="modebar"><button class="mode-button active" data-image-mode="compare" type="button">◐ Compare</button><button class="mode-button" data-image-mode="original" type="button">Original</button><button class="mode-button" data-image-mode="restored" type="button">Restored</button><button class="mode-button" data-image-mode="side" type="button">Side by side</button><span class="mode-spacer"></span><button id="image-zoom-reset" class="zoom-button" type="button">100%</button><button id="image-fullscreen" class="icon-button" title="Fullscreen images" aria-label="Fullscreen images" type="button">⛶</button></div>
+        <div class="image-stage" id="image-stage" data-image-view="compare">
+          <div class="image-pane image-original"><img id="image-before" alt="Selected original image" draggable="false"><span>Original</span></div>
+          <div class="image-pane image-restored"><img id="image-after" alt="Restored image" draggable="false"><span>Restored</span></div>
+          <div class="image-empty" id="image-empty">Add images or a folder, review, then preview a selected image.</div>
+        </div>
+        <div class="image-comparison-controls"><label>Compare wipe <input id="image-wipe" type="range" min="0" max="100" value="50"></label><span>Wheel to zoom · drag to pan · double-click to reset</span></div>
+      </section>
+      <div class="image-selected" id="image-selected">No image selected</div>
+      <section class="image-run-card">
+        <div id="image-status" role="status" aria-live="polite">Choose local images or folders to begin.</div>
+        <progress id="image-progress" max="1" value="0" aria-label="Image batch progress"></progress>
+        <div class="image-destination" id="image-destination"></div>
+        <div class="image-button-row image-actions"><button id="image-review" class="secondary-button" type="button" disabled>Review selection</button><button id="image-preview" class="secondary-button" type="button" disabled>Preview selected</button><button id="image-start" class="primary-button" type="button" disabled>Start image batch</button><button id="image-cancel" class="danger-button" type="button" hidden>Stop batch</button><button id="image-retry" class="secondary-button" type="button" hidden>Retry failed / missing</button><button id="image-open-output" class="secondary-button" type="button" hidden>Open output folder</button><a id="image-log" class="image-log" target="_blank" rel="noopener" hidden>Inference log</a></div>
+      </section>
+      <section class="image-selection-card" aria-label="Selected images"><div class="image-selection-header"><strong id="image-count">No images selected</strong><button id="image-clear" class="secondary-button" type="button">Clear selection</button></div><div class="image-table-scroll"><table class="image-table"><thead><tr><th>Source image</th><th>Output / dimensions</th><th>Status / engine</th><th><span class="visually-hidden">Remove</span></th></tr></thead><tbody id="image-items"></tbody></table></div><div class="image-pagination"><button id="image-prev-page" class="secondary-button" type="button">Previous</button><span id="image-page">0 images</span><button id="image-next-page" class="secondary-button" type="button">Next</button></div></section>
     </section>
   </main>
   <dialog id="engine-help-dialog"><form method="dialog"><button class="dialog-close" aria-label="Close">×</button><h2>Render engines</h2><p><strong>SeedVR2 + TensorRT</strong> runs the SeedVR2 restoration pipeline with the TensorRT-accelerated VAE decoding path. It is the recommended fast option on supported NVIDIA systems.</p><p><strong>SeedVR2 (Legacy)</strong> uses the standard SeedVR2 PyTorch path. It can support more temporal batch sizes, but it is substantially slower and may take a very long time on video. Use it at your own risk for long renders.</p><p>TensorRT currently supports temporal batches 5 and 21. The batch dropdown updates automatically when you switch engines.</p><button class="primary-button" value="close">Got it</button></form></dialog> <dialog id="chunk-help-dialog"><form method="dialog"><button class="dialog-close" aria-label="Close">×</button><h2>Resumable long-video rendering</h2><p>When enabled, the full video is divided into manageable chunks and processed one at a time. Completed chunks are saved immediately, with a small temporal overlap to reduce boundary seams.</p><p>If a render fails, the completed chunks remain on disk. The failure reason and backend log are saved, and <strong>Retry from last chunk</strong> continues from the first unfinished chunk automatically.</p><p><strong>Auto (recommended)</strong> uses the video duration, frame rate/frame count, and temporal batch size to target roughly ten useful checkpoints, then selects the closest available chunk length. The chosen value is saved in the job manifest and render log.</p><p>This feature is off by default. It does not change the normal render quality or require any manual chunk assembly.</p><button class="primary-button" value="close">Got it</button></form></dialog>
-  <script type="module" src="/app.js?v=20260830-29"></script>
+  <dialog id="hardware-dialog" aria-labelledby="hardware-title"><form method="dialog">
+    <button class="dialog-close" aria-label="Close">×</button>
+    <h2 id="hardware-title">Hardware recommendations</h2>
+    <p id="hardware-message" role="status">Inspecting hardware…</p>
+    <p id="hardware-summary"></p>
+    <dl class="recommendation-settings" id="hardware-settings"></dl>
+    <ul class="recommendation-notes" id="hardware-notes"></ul>
+    <p>Only model, temporal batch, attention, block swapping and VAE tiling change. Output size, render engine, seed, color, finishing, export and Beta options stay as you set them. Use <strong>Save current settings</strong> to keep the result.</p>
+    <div class="render-actions"><button class="secondary-button" value="cancel">Cancel</button><button class="primary-button" id="hardware-apply" type="button" disabled>Apply recommended settings</button></div>
+  </form></dialog>
+  <script type="module" src="/app.js?v=20261025-images-1"></script>
+  <script type="module" src="/images.js?v=20261025-images-1"></script>
 </body>
 </html>

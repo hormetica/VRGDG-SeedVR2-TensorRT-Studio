@@ -21,16 +21,34 @@ PROFILES = (
 
 def run(command: list[str]) -> None:
     print("\n> " + subprocess.list2cmdline(command), flush=True)
-    subprocess.run([command[0], "-u", *command[1:]], cwd=ROOT, check=True)
+    started = time.perf_counter()
+    process = subprocess.Popen([command[0], "-u", *command[1:]], cwd=ROOT)
+    try:
+        while True:
+            try:
+                code = process.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                print(f"{Path(command[1]).name}: process active, {time.perf_counter() - started:.0f}s elapsed "
+                      "(export/build progress is not a percentage)", flush=True)
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            process.wait()
+        raise
 
 
 def export_with_fallback(exporter: str, arguments: tuple[str, ...], onnx: Path) -> None:
-    """Export on GPU first, retrying on CPU if the GPU export fails."""
+    """Retry only explicit CUDA OOM, after the failed exporter process exits."""
     gpu_arguments = (*arguments, "--device", "cuda")
     try:
         run([str(PYTHON), str(ROOT / "tools" / exporter), *gpu_arguments, "--output", str(onnx)])
-    except subprocess.CalledProcessError:
-        print("GPU ONNX export failed; retrying this profile on CPU to avoid setup OOM.", flush=True)
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode != 86:
+            raise
+        print("GPU memory was released. Retrying this profile in a fresh CPU FP32 process (FP16 engine interface).", flush=True)
         cpu_arguments = (*arguments, "--device", "cpu")
         run([str(PYTHON), str(ROOT / "tools" / exporter), *cpu_arguments, "--output", str(onnx)])
 

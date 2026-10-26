@@ -5,26 +5,50 @@ This intentionally does not replace the Gradio app or render pipeline yet.
 
 from __future__ import annotations
 
-from dataclasses import replace
-from pathlib import Path
-from threading import Lock, Thread
-from uuid import uuid4
 import json
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import time
 import traceback
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from pathlib import Path
+from threading import Event, Lock, Thread
+from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from seedvr_studio.backend import MODEL_FILES, backend_status, render, reprocess_tensorrt, tensorrt_status
-from seedvr_studio.cancellation import begin_render, cancel_current_render, cancellation_requested
+from seedvr_studio.backend import (
+    MODEL_FILES,
+    backend_status,
+    render,
+    reprocess_tensorrt,
+    tensorrt_status,
+)
+from seedvr_studio.cancellation import (
+    cancel_current_render,
+    cancellation_requested,
+)
+from seedvr_studio.encoding import EXPORT_PRESETS, ExportSettings
+from seedvr_studio.gpu_jobs import cancel_gpu_owner, reserve_gpu
+from seedvr_studio.image_api import BATCHES as IMAGE_BATCHES, router as image_router
+from seedvr_studio.hardware import HARDWARE_PRESETS, detect_hardware, recommend_settings
 from seedvr_studio.jobs import _settings
-from seedvr_studio.media import FrameRateRequiredError, concat_videos, make_center_crop, make_clip, make_thumbnail, probe, resolve_frame_rate, trim_video_start
+from seedvr_studio.media import (
+    FrameRateRequiredError,
+    RenderCancelledError,
+    concat_videos,
+    make_center_crop,
+    make_clip,
+    make_thumbnail,
+    probe,
+    resolve_frame_rate,
+    trim_video_start,
+)
 from seedvr_studio.paths import ensure_workspace
 from seedvr_studio.updater import UpdateError, check_for_updates, launch_updater
 
@@ -32,14 +56,23 @@ ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 OUTPUTS = ROOT / "outputs"
 
-app = FastAPI(title="SeedVR Studio API", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(application):
+    try:
+        yield
+    finally:
+        IMAGE_BATCHES.shutdown()
+
+
+app = FastAPI(title="SeedVR Studio API", version="0.1.0", lifespan=_lifespan)
 JOBS: dict[str, dict[str, object]] = {}
 JOBS_LOCK = Lock()
+app.include_router(image_router)
 
 @app.middleware("http")
 async def disable_frontend_cache(request, call_next):
     response = await call_next(request)
-    if request.url.path in {"/", "/index.html", "/app.js", "/styles.css"}:
+    if request.url.path in {"/", "/index.html", "/app.js", "/images.js", "/styles.css"}:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         response.headers["Pragma"] = "no-cache"
     return response
@@ -75,18 +108,27 @@ def config() -> dict[str, object]:
             "SeedVR2 (Legacy)": [1, 5, 9, 13, 17, 21, 33, 45],
         },
         "seam_modes": {"off": "Off / original output", "noise": "Noise match — gentle", "match": "Color + noise match", "blend": "Boundary dissolve — strongest"},
-        "features": {"skin_finishing": True, "open_output_folder": True, "saved_settings": True, "persistent_decoder": True},
+        "features": {"skin_finishing": True, "open_output_folder": True, "saved_settings": True, "persistent_decoder": True,
+                     "gpu_finishing": True, "warm_worker": True, "scene_cut_detection": True, "performance_reports": True,
+                      "hardware_recommendations": True, "image_batches": True},
+        "export_presets": EXPORT_PRESETS,
         "decoder_modes": {"stable": "Stable", "optimized": "Optimized (Beta)", "optimized_fast": "Optimized Fast (Beta)"},
         "backend": {"seedvr": {"ready": installed, "message": engine}, "tensorrt": {"ready": trt_installed, "message": trt}},
-        "presets": {
-            "Custom / manual": None,
-            "8 GB VRAM — low memory": {"model": "3B FP8 — faster / less VRAM", "resolution": 480, "max_resolution": 1920, "batch_size": 5, "attention": "sageattn_2", "blocks": 36, "vae_tiling": True},
-            "12 GB VRAM — mainstream": {"model": "3B FP8 — faster / less VRAM", "resolution": 720, "max_resolution": 1920, "batch_size": 5, "attention": "sageattn_2", "blocks": 24, "vae_tiling": True},
-            "16 GB VRAM — high memory": {"model": "3B FP8 — faster / less VRAM", "resolution": 1080, "max_resolution": 2560, "batch_size": 5, "attention": "sageattn_2", "blocks": 12, "vae_tiling": True},
-            "24 GB VRAM — enthusiast": {"model": "3B FP8 — faster / less VRAM", "resolution": 1080, "max_resolution": 3840, "batch_size": 21, "attention": "sageattn_2", "blocks": 0, "vae_tiling": False},
-            "32 GB+ VRAM — workstation": {"model": "3B FP16 — best 3B quality", "resolution": 1440, "max_resolution": 3840, "batch_size": 21, "attention": "sageattn_2", "blocks": 0, "vae_tiling": False},
-        },
+        "presets": HARDWARE_PRESETS,
     }
+
+
+@app.get("/api/hardware/recommendation")
+def hardware_recommendation(backend_name: str = "SeedVR2 + TensorRT", output_preset: str = "1K / 1080p",
+                            source_width: int = Query(0, ge=0, le=65536), source_height: int = Query(0, ge=0, le=65536)) -> dict[str, object]:
+    try:
+        response = recommend_settings(detect_hardware(), backend_name=backend_name, output_preset=output_preset,
+                                      source_width=source_width, source_height=source_height)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "TensorRT" in backend_name and not tensorrt_status()[0]:
+        response["notes"].append("TensorRT artifacts are not ready. Complete installation before rendering with this engine.")
+    return response
 
 
 @app.get("/api/outputs")
@@ -94,12 +136,14 @@ def outputs() -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     fps_by_directory: dict[Path, float] = {}
     for path in sorted(OUTPUTS.rglob("*.mp4"), key=lambda item: item.stat().st_mtime, reverse=True):
+        if path.name.endswith((".gpu-pending.mp4", "_noaudio.mp4")):
+            continue
         relative = path.relative_to(OUTPUTS).as_posix()
         if path.parent not in fps_by_directory:
             source_candidates = sorted(candidate for candidate in path.parent.glob("source.*") if candidate.is_file())
             try:
                 fps_by_directory[path.parent] = probe(source_candidates[0] if source_candidates else path).fps
-            except Exception:
+            except Exception:  # noqa: BLE001 -- one damaged source must not break the entire output listing
                 fps_by_directory[path.parent] = 30.0
         result.append({
             "name": path.name,
@@ -143,6 +187,7 @@ def _render_chunked(job_id: str, source: Path, job_dir: Path, output: Path, sett
     overlap_frames = max(0, min(20, int(settings.batch_size) - 1))
     overlap_seconds = overlap_frames / max(info.fps, 1.0)
     checkpoint_path = job_dir / "chunk-manifest.json"
+    export = ExportSettings(preset=settings.export_preset) if settings.export_preset != "software_h264" else None
     manifest: dict[str, object] = {"chunk_seconds": chunk_seconds, "chunk_mode": "auto" if auto_chunking else "manual", "source_frames": round(info.duration * info.fps), "overlap_frames": overlap_frames, "duration": info.duration, "completed": [], "chunks": []}
     if checkpoint_path.exists():
         try:
@@ -161,6 +206,8 @@ def _render_chunked(job_id: str, source: Path, job_dir: Path, output: Path, sett
         chunk_end = min(info.duration, start + chunk_seconds)
         chunk_path = job_dir / "chunks" / f"chunk-{index:04d}.mp4"
         final_chunk = job_dir / "chunks" / f"final-{index:04d}.mp4"
+        if index == 0 or overlap_seconds <= 0:
+            final_chunk = chunk_path
         if index in completed and final_chunk.exists():
             rendered.append(final_chunk)
             report((index + 1) / total, f"Resuming: chunk {index + 1} of {total} already complete")
@@ -171,12 +218,16 @@ def _render_chunked(job_id: str, source: Path, job_dir: Path, output: Path, sett
         make_clip(source, job_dir / "chunks" / f"source-{index:04d}.mp4", render_start, render_length)
         # The backend name is supplied through the values map; this keeps chunk rendering identical to normal rendering.
         from seedvr_studio.backend import render as render_backend
-        render_backend(str(values["backend_name"]), job_dir / "chunks" / f"source-{index:04d}.mp4", chunk_path, settings,
-                       lambda progress, message: report((index + min(progress, 0.99)) / total, f"Chunk {index + 1}/{total}: {message}"))
+        # Each chunk owns its latent/raw/profile artifacts. Sharing a directory
+        # could leave stale end batches from a longer preceding chunk.
+        scratch_output = job_dir / "chunks" / f"render-{index:04d}" / "restored.mp4"
+        scratch_output.parent.mkdir(parents=True, exist_ok=True)
+        render_backend(str(values["backend_name"]), job_dir / "chunks" / f"source-{index:04d}.mp4", scratch_output, settings,
+                       lambda progress, message, index=index: report((index + min(progress, 0.99)) / total, f"Chunk {index + 1}/{total}: {message}"))
         if index and overlap_seconds > 0:
-            trim_video_start(chunk_path, final_chunk, overlap_seconds)
+            trim_video_start(scratch_output, final_chunk, overlap_seconds, export=export)
         else:
-            final_chunk = chunk_path
+            scratch_output.replace(chunk_path)
         rendered.append(final_chunk)
         completed.add(index)
         manifest["completed"] = sorted(completed)
@@ -184,16 +235,41 @@ def _render_chunked(job_id: str, source: Path, job_dir: Path, output: Path, sett
         checkpoint_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         _update(job_id, chunk_index=index + 1, chunk_total=total, resumable=True, checkpoint=str(checkpoint_path), log_file=str(job_dir / "render.log"))
     report(0.99, "Assembling completed chunks")
-    concat_videos(rendered, output)
+    concat_videos(rendered, output, export=export)
     manifest["assembled"] = str(output.relative_to(job_dir))
     checkpoint_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+def _owned_video_job(job_id: str, action, *args) -> None:
+    with JOBS_LOCK:
+        job = JOBS.setdefault(job_id, {})
+        cancelled = job.setdefault("_cancel_event", Event())
+    try:
+        with reserve_gpu(f"video:{job_id}", cancelled):
+            from seedvr_studio.cancellation import begin_render
+            begin_render()
+            action(job_id, *args)
+    except RenderCancelledError as exc:
+        _update(job_id, status="cancelled", message=str(exc))
+    finally:
+        if cancelled.is_set():
+            _update(job_id, status="cancelled", message="Render cancelled; completed checkpoints were kept")
+
+
+def _check_video_cancelled(job_id: str) -> None:
+    with JOBS_LOCK:
+        event = JOBS.get(job_id, {}).get("_cancel_event")
+    if event is not None and event.is_set():
+        raise RenderCancelledError("Render cancelled")
+
+
 def _render_job(job_id: str, source: Path, job_dir: Path, values: dict[str, object]) -> None:
-    begin_render()
+    _owned_video_job(job_id, _render_job_owned, source, job_dir, values)
+
+
+def _render_job_owned(job_id: str, source: Path, job_dir: Path, values: dict[str, object]) -> None:
     started = time.perf_counter()
     try:
-        source_info = probe(source)
         crop_policy = str(values.get("crop_policy", "Preserve original aspect ratio"))
         if crop_policy == "Center crop to 16:9":
             source = make_center_crop(source, job_dir / f"cropped{source.suffix or '.mp4'}")
@@ -217,6 +293,11 @@ def _render_job(job_id: str, source: Path, job_dir: Path, values: dict[str, obje
             source_for_render = source
             output = job_dir / f"{source.stem}-restored.mp4"
         settings = _settings(values["resolution"], values["max_resolution"], values["batch_size"], values["seed"], values["model_label"], values["color_correction"], values["attention_mode"], values["blocks_to_swap"], values["vae_tiling"], values["stop_before_vae"], values["sharpen_enabled"], values["sharpen_strength"], values["grain_enabled"], values["grain_intensity"], values["grain_saturation"], values.get("microtexture_enabled", False), values.get("microtexture_strength", .60), values.get("skin_finishing_enabled", False), values.get("skin_evenness", .25), values.get("skin_smoothing", .20), values.get("skin_redness", .15), values.get("skin_shine", .15), values.get("blemish_mode", "off"), values.get("preserve_marks", True), values.get("seam_mode", "match"), values.get("seam_frames", 2), values.get("decoder_mode", "optimized_fast"), info.fps)
+        settings = replace(settings, gpu_finishing=_bool(values.get("gpu_finishing", False)),
+                           scene_cut_detection=_bool(values.get("scene_cut_detection", False)),
+                           warm_worker=_bool(values.get("warm_worker", False)),
+                           export_preset=str(values.get("export_preset", "software_h264")))
+        ExportSettings(preset=settings.export_preset)
         (job_dir / "job-manifest.json").write_text(json.dumps({
             "version": 1, "job_id": job_id, "job_type": job_type,
             "backend": str(values["backend_name"]), "source": str(source_for_render),
@@ -225,6 +306,7 @@ def _render_job(job_id: str, source: Path, job_dir: Path, values: dict[str, obje
         _update(job_id, status="running", progress=0.02, message="Starting SeedVR2", fps=info.fps, duration=length if job_type == "preview" else info.duration, started_at=time.time())
         log_path = job_dir / "render.log"
         def report(progress: float, message: str) -> None:
+            _check_video_cancelled(job_id)
             try:
                 with log_path.open("a", encoding="utf-8") as log:
                     log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{progress:.3f}] {message}\n")
@@ -239,7 +321,7 @@ def _render_job(job_id: str, source: Path, job_dir: Path, values: dict[str, obje
             _update(job_id, status="complete", progress=1.0, message="Latents captured; stopped before VAE decode", elapsed_seconds=time.perf_counter() - started, original_url=f"/media/{source_for_render.relative_to(OUTPUTS).as_posix()}", restored_url=None, output=None)
             return
         _update(job_id, status="complete", progress=1.0, message="Render complete", elapsed_seconds=time.perf_counter() - started, original_url=f"/media/{source_for_render.relative_to(OUTPUTS).as_posix()}", restored_url=f"/media/{output.relative_to(OUTPUTS).as_posix()}", output=str(output), output_relative=output.relative_to(OUTPUTS).as_posix(), reprocessable=any((job_dir / "tensorrt_decoded").glob("decoded_*.pt")))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- persist render failures for the UI rather than losing its job thread
         log_path = job_dir / "render.log"
         details = "\n".join([f"SeedVR Studio render failure at {time.strftime('%Y-%m-%d %H:%M:%S')}", repr(exc), traceback.format_exc()])
         try:
@@ -247,11 +329,15 @@ def _render_job(job_id: str, source: Path, job_dir: Path, values: dict[str, obje
                 log.write(details + "\n")
         except OSError:
             pass
-        final_status = "cancelled" if cancellation_requested() else "error"
+        final_status = "cancelled" if isinstance(exc, RenderCancelledError) or cancellation_requested() else "error"
         _update(job_id, status=final_status, message=str(exc), elapsed_seconds=time.perf_counter() - started, error=str(exc), failure_reason=str(exc), failure_code="fps_required" if isinstance(exc, FrameRateRequiredError) else None, log_file=str(log_path), resumable=_bool(values.get("chunked_render", False)))
 
 
 def _reprocess_job(job_id: str, source_output: Path, values: dict[str, object]) -> None:
+    _owned_video_job(job_id, _reprocess_job_owned, source_output, values)
+
+
+def _reprocess_job_owned(job_id: str, source_output: Path, values: dict[str, object]) -> None:
     started = time.perf_counter()
     job_dir = source_output.parent
     try:
@@ -263,6 +349,7 @@ def _reprocess_job(job_id: str, source_output: Path, values: dict[str, object]) 
         log_path = job_dir / f"reprocess-{job_id}.log"
         _update(job_id, status="running", progress=0.01, message="Loading saved TensorRT batches", started_at=time.time(), log_file=str(log_path))
         def report(progress: float, message: str) -> None:
+            _check_video_cancelled(job_id)
             try:
                 with log_path.open("a", encoding="utf-8") as log:
                     log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{progress:.3f}] {message}\n")
@@ -275,23 +362,27 @@ def _reprocess_job(job_id: str, source_output: Path, values: dict[str, object]) 
                            microtexture_enabled=_bool(values.get("microtexture_enabled", False)), microtexture_strength=float(values.get("microtexture_strength", .60)),
                            skin_finishing_enabled=_bool(values.get("skin_finishing_enabled", False)), skin_evenness=float(values.get("skin_evenness", .25)), skin_smoothing=float(values.get("skin_smoothing", .20)),
                            skin_redness=float(values.get("skin_redness", .15)), skin_shine=float(values.get("skin_shine", .15)), blemish_mode=str(values.get("blemish_mode", "off")), preserve_marks=_bool(values.get("preserve_marks", True)),
-                           seed=int(values.get("seed", 42)), seam_mode=str(values.get("seam_mode", "match")), seam_frames=int(values.get("seam_frames", 2)), progress_callback=report)
+                            seed=int(values.get("seed", 42)), seam_mode=str(values.get("seam_mode", "match")), seam_frames=int(values.get("seam_frames", 2)), progress_callback=report,
+                            export_preset=str(values.get("export_preset", "software_h264")),
+                            scene_cut_detection=_bool(values.get("scene_cut_detection", False)))
         _update(job_id, status="complete", progress=1.0, message="Post-only reprocess complete", elapsed_seconds=time.perf_counter() - started,
                 original_url=f"/media/{source.relative_to(OUTPUTS).as_posix()}", restored_url=f"/media/{output.relative_to(OUTPUTS).as_posix()}",
                 output=str(output), output_relative=output.relative_to(OUTPUTS).as_posix(), reprocessable=True, fps=probe(source).fps)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- persist reprocess failures for the UI
         log_path = job_dir / f"reprocess-{job_id}.log"
         try:
             with log_path.open("a", encoding="utf-8") as log:
-                log.write(f"{repr(exc)}\n{traceback.format_exc()}\n")
+                log.write(f"{exc!r}\n{traceback.format_exc()}\n")
         except OSError:
             pass
-        _update(job_id, status="error", message=str(exc), error=str(exc), failure_reason=str(exc), elapsed_seconds=time.perf_counter() - started, log_file=str(log_path), resumable=False)
+        _update(job_id, status="cancelled" if isinstance(exc, RenderCancelledError) or cancellation_requested() else "error",
+                message=str(exc), error=str(exc), failure_reason=str(exc), elapsed_seconds=time.perf_counter() - started,
+                log_file=str(log_path), resumable=False)
 
 
 @app.post("/api/jobs")
 async def create_job(
-    file: UploadFile = File(...),
+    file: UploadFile = File(...),  # noqa: B008 -- FastAPI dependency declaration
     job_type: str = Form("preview"), backend_name: str = Form("SeedVR2 + TensorRT"),
     output_preset: str = Form("1K / 1080p"), crop_policy: str = Form("Preserve original aspect ratio"),
     preview_start: float = Form(0), preview_seconds: float = Form(3), resolution: int = Form(1080), max_resolution: int = Form(3840), batch_size: int = Form(21), seed: int = Form(42),
@@ -302,7 +393,11 @@ async def create_job(
     skin_redness: float = Form(.15), skin_shine: float = Form(.15), blemish_mode: str = Form("off"), preserve_marks: str = Form("true"),
     seam_mode: str = Form("match"), seam_frames: int = Form(2),
     chunked_render: str = Form("false"), chunk_seconds: float = Form(0), decoder_mode: str = Form("optimized_fast"), source_fps: float = Form(0),
+    gpu_finishing: str = Form("false"), scene_cut_detection: str = Form("false"), warm_worker: str = Form("false"),
+    export_preset: str = Form("software_h264"),
 ) -> dict[str, str]:
+    if export_preset not in EXPORT_PRESETS:
+        raise HTTPException(status_code=400, detail="Unknown export preset")
     ensure_workspace()
     job_id = uuid4().hex[:10]
     job_dir = OUTPUTS / f"js-{job_type}-{job_id}"
@@ -328,7 +423,10 @@ def create_reprocess_job(
     skin_finishing_enabled: str = Form("false"), skin_evenness: float = Form(.25), skin_smoothing: float = Form(.20),
     skin_redness: float = Form(.15), skin_shine: float = Form(.15), blemish_mode: str = Form("off"), preserve_marks: str = Form("true"),
     seam_mode: str = Form("match"), seam_frames: int = Form(2),
+    export_preset: str = Form("software_h264"), scene_cut_detection: str = Form("false"),
 ) -> dict[str, str]:
+    if export_preset not in EXPORT_PRESETS:
+        raise HTTPException(status_code=400, detail="Unknown export preset")
     relative = output_path.removeprefix("/media/").lstrip("/\\")
     source_output = (OUTPUTS / relative).resolve()
     if OUTPUTS.resolve() not in source_output.parents or not source_output.is_file():
@@ -341,7 +439,8 @@ def create_reprocess_job(
               "microtexture_enabled": _bool(microtexture_enabled), "microtexture_strength": microtexture_strength,
               "skin_finishing_enabled": _bool(skin_finishing_enabled), "skin_evenness": skin_evenness, "skin_smoothing": skin_smoothing,
               "skin_redness": skin_redness, "skin_shine": skin_shine, "blemish_mode": blemish_mode, "preserve_marks": _bool(preserve_marks),
-              "seam_mode": seam_mode, "seam_frames": seam_frames}
+              "seam_mode": seam_mode, "seam_frames": seam_frames,
+              "export_preset": export_preset, "scene_cut_detection": _bool(scene_cut_detection)}
     with JOBS_LOCK:
         JOBS[job_id] = {"id": job_id, "status": "queued", "progress": 0.0, "message": "Queued for post-only reprocess", "job_type": "reprocess", "resumable": False,
                         "_source": str(source_output), "_job_dir": str(source_output.parent), "_values": values}
@@ -375,6 +474,7 @@ def resume_job(job_id: str) -> dict[str, object]:
         job["message"] = "Resuming from the last completed chunk"
         job["error"] = None
         job["failure_reason"] = None
+        job["_cancel_event"] = Event()
     Thread(target=_render_job, args=(job_id, source, job_dir, values), daemon=True).start()
     return {"ok": True, "id": job_id}
 
@@ -391,12 +491,34 @@ def job_log(job_id: str) -> FileResponse:
     return FileResponse(log_path, media_type="text/plain", filename=f"seedvr-{job_id}.log")
 
 
+@app.get("/api/jobs/{job_id}/profile")
+def job_profile(job_id: str) -> dict[str, object]:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    root = Path(str(job["_job_dir"])).resolve()
+    reports = []
+    for path in sorted([*root.rglob("*-profile.json"), *root.rglob("decoder-manifest.json")]):
+        if root not in path.resolve().parents:
+            continue
+        try:
+            reports.append({"path": str(path.relative_to(root)), "report": json.loads(path.read_text(encoding="utf-8"))})
+        except (OSError, ValueError):
+            continue
+    return {"job_id": job_id, "reports": reports}
+
+
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str) -> dict[str, object]:
     with JOBS_LOCK:
         if job_id not in JOBS:
             raise HTTPException(status_code=404, detail="Job not found")
-    message = cancel_current_render()
+        job = JOBS[job_id]
+        if job.get("status") in {"complete", "cancelled", "error"}:
+            return {"ok": True, "message": "This render has already stopped"}
+        job.setdefault("_cancel_event", Event()).set()
+    message = cancel_gpu_owner(f"video:{job_id}", cancel_current_render) or "Cancelled this queued render; other GPU work was left running"
     with JOBS_LOCK:
         started_at = JOBS[job_id].get("started_at")
     elapsed = time.time() - float(started_at) if started_at else 0.0
@@ -413,7 +535,7 @@ def update_check() -> dict[str, object]:
 def apply_update() -> dict[str, object]:
     with JOBS_LOCK:
         active_render = any(job.get("status") in {"queued", "running"} for job in JOBS.values())
-    if active_render:
+    if active_render or IMAGE_BATCHES.busy():
         raise HTTPException(status_code=409, detail="Finish or stop the active render before updating.")
     status = check_for_updates(ROOT)
     if not status["supported"]:
@@ -434,6 +556,7 @@ def apply_update() -> dict[str, object]:
 @app.post("/api/shutdown")
 def shutdown() -> dict[str, object]:
     """Release active inference resources and stop the local JS Studio server."""
+    IMAGE_BATCHES.shutdown()
     message = cancel_current_render()
     def stop_server() -> None:
         time.sleep(0.35)
@@ -484,6 +607,11 @@ def serve_app_js() -> FileResponse:
 @app.get("/styles.css", include_in_schema=False)
 def serve_styles_css() -> FileResponse:
     return FileResponse(WEB / "styles.css", media_type="text/css")
+
+
+@app.get("/images.js", include_in_schema=False)
+def serve_images_js() -> FileResponse:
+    return FileResponse(WEB / "images.js", media_type="application/javascript")
 
 
 app.mount("/", StaticFiles(directory=WEB, html=True), name="web")

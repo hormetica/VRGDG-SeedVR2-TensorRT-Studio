@@ -6,12 +6,11 @@ import re
 import subprocess
 import sys
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
-from .media import MediaError
+from .media import MediaError, RenderCancelledError
 from .paths import ROOT, VENV_PYTHON
-
 
 RUNNER = ROOT / "tools" / "run_tensorrt_persistent.py"
 ProgressCallback = Callable[[float, str], None]
@@ -30,6 +29,8 @@ def run_persistent_decoder(
     total: int,
     child_env: dict[str, str],
     progress_callback: ProgressCallback | None,
+    *,
+    combined: bool = False,
 ) -> None:
     """Run one decoder process and stream its per-batch progress."""
     command = [str(VENV_PYTHON), "-u", str(RUNNER), str(manifest_path)]
@@ -51,13 +52,20 @@ def run_persistent_decoder(
         line = raw_line.rstrip()
         output_tail.append(line)
         _safe_print(line)
-        match = re.search(r"PERSISTENT_PROGRESS (\d+)/(\d+)", line)
+        match = re.search(r"(PERSISTENT_PROGRESS|ASSEMBLY_PROGRESS) (\d+)/(\d+)", line)
         if match and progress_callback:
-            current = int(match.group(1))
+            current = int(match.group(2))
+            if combined:
+                fraction = (current - (0.5 if match.group(1) == "PERSISTENT_PROGRESS" else 0)) / max(1, total)
+                progress_callback(0.78 + 0.2 * fraction, f"GPU decoding and finishing batch {current} of {total}")
+                continue
             progress_callback(
                 0.78 + 0.12 * current / max(1, total),
                 f"Optimized TensorRT VAE decoding batch {current} of {total}",
             )
     return_code = process.wait()
     if return_code:
+        from .cancellation import cancellation_requested
+        if cancellation_requested():
+            raise RenderCancelledError("Render cancelled")
         raise MediaError(f"Optimized TensorRT VAE decode failed:\n{'\n'.join(output_tail)}")

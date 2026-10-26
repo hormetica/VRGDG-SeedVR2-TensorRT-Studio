@@ -4,6 +4,7 @@ import gradio as gr
 
 from .backend import MODEL_FILES, backend_status, tensorrt_status
 from .cancellation import cancel_current_render
+from .hardware import HARDWARE_PRESETS
 from .jobs import describe_video, empty_inspection_player_html, render_full, render_preview
 from .paths import ensure_workspace
 
@@ -123,31 +124,6 @@ watch('value', () => requestAnimationFrame(mount));
 """
 
 
-HARDWARE_PRESETS = {
-    "Custom / manual": None,
-    "8 GB VRAM — low memory": {
-        "model": "3B FP8 — faster / less VRAM", "resolution": 480, "max_resolution": 1920,
-        "batch_size": 5, "attention": "sageattn_2", "blocks": 36, "vae_tiling": True,
-    },
-    "12 GB VRAM — mainstream": {
-        "model": "3B FP8 — faster / less VRAM", "resolution": 720, "max_resolution": 1920,
-        "batch_size": 5, "attention": "sageattn_2", "blocks": 24, "vae_tiling": True,
-    },
-    "16 GB VRAM — high memory": {
-        "model": "3B FP8 — faster / less VRAM", "resolution": 1080, "max_resolution": 2560,
-        "batch_size": 5, "attention": "sageattn_2", "blocks": 12, "vae_tiling": True,
-    },
-    "24 GB VRAM — enthusiast": {
-        "model": "3B FP8 — faster / less VRAM", "resolution": 1080, "max_resolution": 3840,
-        "batch_size": 21, "attention": "sageattn_2", "blocks": 0, "vae_tiling": False,
-    },
-    "32 GB+ VRAM — workstation": {
-        "model": "3B FP16 — best 3B quality", "resolution": 1440, "max_resolution": 3840,
-        "batch_size": 21, "attention": "sageattn_2", "blocks": 0, "vae_tiling": False,
-    },
-}
-
-
 def apply_hardware_preset(name, model, resolution, max_resolution, batch_size, attention, blocks, vae_tiling):
     preset = HARDWARE_PRESETS.get(name)
     if preset is None:
@@ -218,4 +194,3 @@ def build_app() -> gr.Blocks:
         full_button.click(render_full, inputs=common, outputs=[status, comparison_player], concurrency_limit=1, show_progress="full")
         stop_button.click(cancel_current_render, outputs=status, queue=False, show_progress="hidden")
     return app
-

@@ -30,7 +30,12 @@ def main() -> None:
     if blob is None:
         raise RuntimeError("TensorRT-RTX failed to build the engine")
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes(blob)
+    temporary = output.with_name(output.stem + ".building.rtxplan")
+    try:
+        temporary.write_bytes(blob)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
     print(f"TensorRT-RTX: {trt.__version__}")
     print(f"Parsed layers: {network.num_layers}")
     print(f"Inputs/outputs: {network.num_inputs}/{network.num_outputs}")

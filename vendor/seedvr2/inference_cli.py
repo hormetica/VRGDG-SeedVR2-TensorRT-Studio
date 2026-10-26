@@ -1,4 +1,4 @@
-# Modified by VRGDG SeedVR2 TensorRT Studio: adds TensorRT latent capture/encoder handoff integration.
+# Modified by VRGDG SeedVR2 TensorRT Studio: TensorRT handoff, bounded input reads, latent capture, stage profiling, reusable argument parsing.
 #!/usr/bin/env python3
 """
 SeedVR2 Video Upscaler - Standalone CLI Interface
@@ -54,6 +54,7 @@ import multiprocessing as mp
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
 from pathlib import Path
+from functools import wraps
 
 # Set up path before any other imports to fix module resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -61,7 +62,7 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 # Set environment variable so all spawned processes can find modules
-os.environ['PYTHONPATH'] = script_dir + ':' + os.environ.get('PYTHONPATH', '')
+os.environ['PYTHONPATH'] = script_dir + os.pathsep + os.environ.get('PYTHONPATH', '')
 
 # Ensure safe CUDA usage with multiprocessing
 if mp.get_start_method(allow_none=True) != 'spawn':
@@ -72,10 +73,15 @@ if mp.get_start_method(allow_none=True) != 'spawn':
 if platform.system() == "Darwin":
     # MPS allocator requires: low_watermark <= high_watermark
     # Setting both to 0.0 disables PyTorch memory limits, letting macOS manage memory
-    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
-    os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
+    if "torch" not in sys.modules:
+        os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+        os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+    # A host may import the CLI after importing torch. Its allocator was already
+    # selected at library load; changing this variable now can assert or crash
+    # in the first CUDA allocation (including the BF16 capability probe).
+    if "torch" not in sys.modules:
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
     # Pre-parse arguments that must be handled before torch import
     _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -135,6 +141,49 @@ from src.utils.debug import Debug
 from src.optimization.memory_manager import clear_memory, get_gpu_backend, is_cuda_available
 from src.optimization.performance import optimized_channels_to_second
 debug = Debug(enabled=False)  # Will be enabled via --debug CLI flag
+
+_STUDIO_PROFILE = None
+
+
+def _profile_frames(function):
+    @wraps(function)
+    def profiled(*positional, **keywords):
+        global _STUDIO_PROFILE
+        profile_path = os.environ.get("SEEDVR2_PROFILE_PATH")
+        if not profile_path:
+            return function(*positional, **keywords)
+        studio_root = str(Path(__file__).resolve().parents[2])
+        if studio_root not in sys.path:
+            sys.path.insert(0, studio_root)
+        from seedvr_studio.profiling import PerformanceReport
+        from src.optimization.compatibility import ATTENTION_BACKENDS_USED
+        args = keywords.get("args") or positional[1]
+        previous = _STUDIO_PROFILE
+        report = PerformanceReport(kind="inference", attention_requested=args.attention_mode,
+                                   model=args.dit_model, batch_size=args.batch_size,
+                                   cache_dit=args.cache_dit, cache_vae=args.cache_vae)
+        _STUDIO_PROFILE = report
+        ATTENTION_BACKENDS_USED.clear()
+        try:
+            with report.stage("inference_total", cuda=torch.cuda.is_available()):
+                return function(*positional, **keywords)
+        finally:
+            if error := sys.exc_info()[1]:
+                report.metadata["error"] = str(error)
+            report.metadata["attention_calls"] = dict(ATTENTION_BACKENDS_USED)
+            if torch.cuda.is_initialized():
+                report.metadata.update(gpu=torch.cuda.get_device_name(), peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated())
+            print(f"STUDIO_ATTENTION requested={args.attention_mode} used={dict(ATTENTION_BACKENDS_USED)}", flush=True)
+            report.write(Path(profile_path))
+            _STUDIO_PROFILE = previous
+    return profiled
+
+
+def _profile_call(name, function, *args, **kwargs):
+    if _STUDIO_PROFILE is None:
+        return function(*args, **kwargs)
+    with _STUDIO_PROFILE.stage(name, cuda=torch.cuda.is_available()):
+        return function(*args, **kwargs)
 
 
 def _capture_pending_vae_latents(runner, ctx: Dict[str, Any], debug: Debug) -> None:
@@ -458,6 +507,50 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     return str(output_path.resolve())
 
 
+class _VideoFrameSource:
+    """Read-only THWC input whose integer/unit-step slices materialize on demand.
+
+    Latent capture already encodes one temporal batch at a time. Keep the source
+    video open instead of loading a whole clip before that batching takes place.
+    This is deliberately not a Tensor: only metadata and frame slicing are used
+    by generation setup and encoding. The caller owns the capture lifecycle.
+    """
+
+    def __init__(self, cap, frame_count: int, height: int, width: int, start_frame: int = 0):
+        self.shape = (frame_count, height, width, 3)
+        self._cap = cap
+        self._start_frame = start_frame
+        self._position = 0
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, index):
+        single = isinstance(index, int)
+        if single:
+            start = index if index >= 0 else len(self) + index
+            if not 0 <= start < len(self):
+                raise IndexError(index)
+            end = start + 1
+        elif isinstance(index, slice):
+            start, end, step = index.indices(len(self))
+            if step != 1:
+                raise ValueError("Video frame slices require step=1")
+        else:
+            raise TypeError("Video frames require an integer or a temporal slice")
+        if end <= start:
+            return torch.empty((0, *self.shape[1:]), dtype=torch.float16)
+        if start != self._position:
+            if not self._cap.set(cv2.CAP_PROP_POS_FRAMES, self._start_frame + start):
+                raise ValueError(f"Cannot seek source video to frame {self._start_frame + start}")
+        frames = _read_frames_from_cap(self._cap, end - start)
+        if frames is None or len(frames) != end - start:
+            raise ValueError(f"Source video ended before frame {self._start_frame + end}")
+        self._position = end
+        frames = frames.to(torch.float16)
+        return frames[0] if single else frames
+
+
 def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
                        output_path: Optional[str] = None, format_auto_detected: bool = False,
                        runner_cache: Optional[Dict[str, Any]] = None) -> int:
@@ -529,6 +622,26 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
             debug.log(f"No frames to process after skipping {args.skip_first_frames} of {total_frames}", 
                      level="WARNING", category="file", force=True)
             cap.release()
+            return 0
+
+        # Studio's TensorRT handoff only needs latents, not a whole-video RGB
+        # tensor. Preserve encode-all -> DiT-all and global latent numbering;
+        # invoking the core separately per chunk would overwrite those files.
+        # Explicit streaming, prepending, MPS, and multi-GPU retain their existing
+        # tensor paths, which have additional concatenation/device requirements.
+        if (args.stop_before_vae and len(device_list) == 1 and args.chunk_size <= 0
+                and args.prepend_frames == 0 and get_gpu_backend() != "mps"):
+            debug.log(f"On-demand video input: {frames_to_process} frames, reading at most "
+                      f"{args.batch_size} frames per temporal batch (no whole-video RGB buffer)",
+                      category="info", force=True, indent_level=1)
+            try:
+                frames = _VideoFrameSource(cap, frames_to_process, height, width, args.skip_first_frames)
+                _process_frames_core(frames_tensor=frames, args=args, device_id=device_list[0],
+                                     debug=debug, runner_cache=runner_cache)
+            finally:
+                cap.release()
+            debug.log("Stop-before-VAE test complete; no output video written.",
+                      category="vae", force=True)
             return 0
         
         # Streaming mode: process in chunks
@@ -873,8 +986,9 @@ def save_frames_to_image(
 # Core Processing Logic
 # =============================================================================
 
+@_profile_frames
 def _process_frames_core(
-    frames_tensor: torch.Tensor,
+    frames_tensor: torch.Tensor | _VideoFrameSource,
     args: argparse.Namespace,
     device_id: str,
     debug: Debug,
@@ -887,7 +1001,8 @@ def _process_frames_core(
     Supports both cached (direct) and non-cached (worker) execution modes.
     
     Args:
-        frames_tensor: Input frames [T, H, W, C], Float16/Float32, range [0,1]
+        frames_tensor: Input frames [T, H, W, C], Float16/Float32, range [0,1],
+            or a batch-readable video source for latent-only processing
         args: Command-line arguments with all processing settings
         device_id: Device ID for inference ("0", "1", etc.)
         debug: Debug instance for logging
@@ -958,7 +1073,7 @@ def _process_frames_core(
     dit_id = "cli_dit" if cache_dit else None
     vae_id = "cli_vae" if cache_vae else None
     
-    runner, cache_context = prepare_runner(
+    runner, cache_context = _profile_call("model_setup", prepare_runner,
         dit_model=args.dit_model,
         vae_model=DEFAULT_VAE,
         model_dir=model_dir,
@@ -1009,7 +1124,7 @@ def _process_frames_core(
     log_generation_start(gen_info, debug)
     
     # Phase 1: Encode
-    ctx = encode_all_batches(
+    ctx = _profile_call("vae_encoding", encode_all_batches,
         runner, ctx=ctx, images=frames_tensor,
         debug=debug, 
         batch_size=args.batch_size,
@@ -1024,7 +1139,7 @@ def _process_frames_core(
     )
     
     # Phase 2: Upscale
-    ctx = upscale_all_batches(
+    ctx = _profile_call("dit_restoration", upscale_all_batches,
         runner, ctx=ctx, debug=debug, progress_callback=None,
         seed=args.seed,
         latent_noise_scale=args.latent_noise_scale,
@@ -1032,19 +1147,19 @@ def _process_frames_core(
     )
 
     if args.stop_before_vae:
-        _capture_pending_vae_latents(runner, ctx, debug)
+        _profile_call("latent_capture", _capture_pending_vae_latents, runner, ctx, debug)
         debug.log("Stop-before-VAE test mode: DiT complete; latent capture finished. Skipping VAE decode.",
                   category="vae", force=True)
         return torch.empty((0, 0, 0, 0), dtype=torch.float32)
     
     # Phase 3: Decode
-    ctx = decode_all_batches(
+    ctx = _profile_call("vae_decoding", decode_all_batches,
         runner, ctx=ctx, debug=debug, progress_callback=None,
         cache_model=cache_vae
     )
     
     # Phase 4: Post-process
-    ctx = postprocess_all_batches(
+    ctx = _profile_call("postprocessing", postprocess_all_batches,
         ctx=ctx, debug=debug, progress_callback=None,
         color_correction=args.color_correction,
         prepend_frames=0,  # Worker mode handles this in main process
@@ -1343,7 +1458,7 @@ def _gpu_processing(
 # Argument Parsing
 # =============================================================================
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(argv=None) -> argparse.Namespace:
     """
     Parse and validate command-line arguments for SeedVR2 CLI.
     
@@ -1534,10 +1649,10 @@ Examples:
                         help="Enable verbose debug logging")
     
     # Auto-show help if no arguments provided
-    if len(sys.argv) == 1:
+    if argv is None and len(sys.argv) == 1:
         sys.argv.append('--help')
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 # =============================================================================

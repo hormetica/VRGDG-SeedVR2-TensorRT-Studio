@@ -61,7 +61,39 @@ The installer does not require a separate full CUDA Toolkit. The Python CUDA and
 
 ### If TensorRT export appears hung
 
-The first TensorRT profile performs a fixed-shape ONNX export and can take several minutes. The installer prints an export start message and elapsed time; leave the window open while it runs. Engine preparation is resumable, so completed `.rtxplan` files are skipped on the next run.
+Each TensorRT profile performs a fixed-shape ONNX export followed by an engine
+build. Both steps print elapsed-time heartbeats; these indicate that the process
+is active, not a percentage or guaranteed completion time. Engine preparation is
+resumable, so completed `.rtxplan` files are skipped on the next run.
+
+`TracerWarning: Converting a tensor to a Python boolean` is expected for the
+fixed-shape VAE profiles. These engines are intentionally specialized to the
+printed dimensions and temporal frame count; this warning alone is not failure.
+
+GPU export keeps cuDNN enabled. Only the VAE's direct-cuDNN override is bypassed
+during tracing, allowing standard ONNX `Conv` operators without forcing enormous
+native convolution workspaces. If CUDA still runs out of memory, the exporter
+exits completely before a fresh CPU process retries. CPU computation uses FP32
+instead of slow CPU FP16 convolution, while explicit casts preserve the engines'
+FP16 input/output contract. Other export errors are reported rather than being
+mislabelled as OOM and blindly retried.
+
+Older exporters printed **"CUDA ONNX export ran out of memory; falling back to
+CPU export"** and could spend a very long time on large CPU FP16 traces. They
+also ignored `--device cpu`. If using that code, update the exporter before
+retrying rather than repeatedly launching another copy. ONNX files and engine
+plans are now published atomically so an interrupted new export does not replace
+a completed artifact.
+
+To resume only missing engine preparation after fixing an export problem, without
+reinstalling packages or downloading models again:
+
+```powershell
+.\.venv\Scripts\python.exe -u .\scripts\prepare_tensorrt.py
+```
+
+After it succeeds, rerun the normal installer for the final readiness check, or
+run `scripts\verify_install.py` in a shell where FFmpeg and FFprobe are on PATH.
 
 If you need to finish setup without TensorRT, run:
 

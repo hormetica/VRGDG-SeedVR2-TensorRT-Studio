@@ -7,9 +7,15 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .encoding import ExportSettings, select_encoder
+
 
 class MediaError(RuntimeError):
     pass
+
+
+class RenderCancelledError(MediaError):
+    """Cancellation remains attached to this job even after the next job starts."""
 
 
 class FrameRateRequiredError(MediaError):
@@ -54,6 +60,7 @@ def run(command: list[str], cwd: Path | None = None) -> subprocess.CompletedProc
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
     )
     if process.returncode:
         tail = "\n".join(process.stdout.splitlines()[-30:])
@@ -95,22 +102,26 @@ def make_clip(source: Path, target: Path, start: float, duration: float) -> Path
     return target
 
 
-def trim_video_start(source: Path, target: Path, start: float) -> Path:
+def trim_video_start(source: Path, target: Path, start: float, *, export: ExportSettings | None = None) -> Path:
     """Drop a temporal overlap from the front of a rendered chunk."""
     target.parent.mkdir(parents=True, exist_ok=True)
     offset = max(0.0, float(start))
+    video_filter = f"trim=start={offset:.6f},setpts=PTS-STARTPTS"
+    encoding = ["-vf", video_filter, "-c:v", "libx264", "-preset", "fast", "-crf", "15", "-pix_fmt", "yuv420p"]
+    if export is not None:
+        info = probe(source)
+        encoding = select_encoder(export, info.width, info.height).arguments(video_filter=video_filter, raw_rgb=False)
     run([
         _tool("ffmpeg"), "-y", "-i", str(source),
-        "-vf", f"trim=start={offset:.6f},setpts=PTS-STARTPTS",
+        *encoding,
         "-af", f"atrim=start={offset:.6f},asetpts=PTS-STARTPTS",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "15",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", str(target),
     ])
     return target
 
 
-def concat_videos(chunks: list[Path], target: Path) -> Path:
+def concat_videos(chunks: list[Path], target: Path, *, export: ExportSettings | None = None) -> Path:
     """Join rendered chunks with one continuous timeline.
 
     Stream-copy concatenation preserves per-chunk timestamps. Re-encoding the
@@ -122,14 +133,17 @@ def concat_videos(chunks: list[Path], target: Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     listing = target.parent / "concat-list.txt"
     listing.write_text("\n".join(f"file '{path.resolve().as_posix().replace("'", "'\\''")}'" for path in chunks), encoding="utf-8")
+    encoding = ["-c:v", "libx264", "-preset", "fast", "-crf", "15", "-pix_fmt", "yuv420p"]
+    if export is not None:
+        info = probe(chunks[0])
+        encoding = select_encoder(export, info.width, info.height).arguments(raw_rgb=False)
     try:
         run([
             _tool("ffmpeg"), "-y", "-f", "concat", "-safe", "0", "-i", str(listing),
             "-map", "0:v:0", "-map", "0:a?",
             "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
             "-fps_mode", "cfr",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "15",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+            *encoding, "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", str(target),
         ])
     finally:

@@ -15,13 +15,17 @@ ROOT = Path(__file__).resolve().parents[1]
 VENDOR = ROOT / "vendor" / "seedvr2"
 sys.path.insert(0, str(VENDOR))
 
-from src.core.generation_utils import prepare_runner, setup_generation_context  # noqa: E402
-from src.core.model_loader import materialize_model  # noqa: E402
-from src.models.video_vae_v3.modules.types import MemoryState  # noqa: E402
-from src.models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d  # noqa: E402
-from src.utils.debug import Debug  # noqa: E402
-from src.utils.model_registry import DEFAULT_DIT, DEFAULT_VAE  # noqa: E402
-from onnx_export_utils import export_portable_onnx  # noqa: E402
+from src.core.generation_utils import prepare_runner, setup_generation_context
+from src.core.model_loader import materialize_model
+from src.models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d
+from src.models.video_vae_v3.modules.types import MemoryState
+from src.utils.debug import Debug
+from src.utils.model_registry import DEFAULT_DIT, DEFAULT_VAE
+
+if __package__:
+    from .onnx_export_utils import export_device, export_portable_onnx, run_export
+else:
+    from onnx_export_utils import export_device, export_portable_onnx, run_export
 
 
 class Encoder(torch.nn.Module):
@@ -59,11 +63,9 @@ def main() -> None:
     parser.add_argument("--legacy-export", action="store_true")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda", help="Device used for ONNX export; CPU avoids large GPU allocations.")
     args = parser.parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for the VAE export")
     if args.frames < 1 or (args.frames - 1) % 4 or args.height % 8 or args.width % 8:
         raise ValueError("frames must be 4n+1 and spatial dimensions divisible by 8")
-    device = torch.device("cuda")
+    device = export_device(args.device)
     debug = Debug(enabled=True)
     ctx = setup_generation_context(dit_device=device, vae_device=device,
                                    tensor_offload_device=None, debug=debug)
@@ -77,17 +79,15 @@ def main() -> None:
     materialize_model(runner, "vae", device, runner.config, debug)
     vae = runner.vae.eval()
     configure_fixed_profile(vae)
-    encoder = Encoder(vae).eval()
+    encoder = Encoder(vae).eval().to(device=device, dtype=ctx["compute_dtype"])
     video = torch.randn(1, 3, args.frames, args.height, args.width, device=device, dtype=torch.float16)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with torch.inference_mode():
-        reference = encoder(video)
         export_portable_onnx(encoder, (video,), args.output, legacy=args.legacy_export)
     print(f"Exported: {args.output}")
     print(f"Video shape: {tuple(video.shape)}")
-    print(f"Raw latent shape: {tuple(reference.shape)}")
-    print(f"Reference range: {reference.min().item():.6f} .. {reference.max().item():.6f}")
+    print(f"Export device: {device}; engine inputs/outputs remain FP16")
 
 
 if __name__ == "__main__":
-    main()
+    run_export(main)
