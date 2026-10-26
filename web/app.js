@@ -85,23 +85,44 @@ $('#attention').value = 'sageattn_2';
 $('#color').value = 'none';
 
 const format = (value) => { const v = Math.max(0, Number(value) || 0); const m = Math.floor(v / 60); const s = Math.floor(v % 60); const ms = Math.floor((v % 1) * 1000); return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(ms).padStart(3,'0')}`; };
-const duration = () => Math.min(Number.isFinite(before.duration) ? before.duration : 0, Number.isFinite(after.duration) ? after.duration : 0);
-const update = () => { const d = duration(); $('#seek').max = d; $('#seek').value = before.currentTime || 0; $('#clock').textContent = `${format(before.currentTime)} / ${format(d)}`; const total = Math.max(0, Math.round(d * fps) - 1); $('#frame').max = total; $('#frame').value = Math.min(total, Math.round((before.currentTime || 0) * fps)); $('#frame-total').textContent = `/ ${total}`; };
-const seek = (value) => { const t = Math.max(0, Math.min(duration(), Number(value) || 0)); before.currentTime = t; after.currentTime = t; update(); };
+const loadedVideos = () => [before, after].filter((video) => video.hasAttribute('src'));
+const playbackVideo = () => before.hasAttribute('src') ? before : after;
+const refreshPlaybackButton = () => { const playing = !playbackVideo().paused; $('#play').textContent = playing ? 'Ⅱ' : '▶'; $('#play').setAttribute('aria-label', playing ? 'Pause' : 'Play'); };
+const duration = () => { const values = loadedVideos().map((video) => video.duration).filter(Number.isFinite); return values.length ? Math.min(...values) : 0; };
+const update = () => { const d = duration(); const currentTime = playbackVideo().currentTime || 0; $('#seek').max = d; $('#seek').value = currentTime; $('#clock').textContent = `${format(currentTime)} / ${format(d)}`; const total = Math.max(0, Math.round(d * fps) - 1); $('#frame').max = total; $('#frame').value = Math.min(total, Math.round(currentTime * fps)); $('#frame-total').textContent = `/ ${total}`; ['seek', 'frame', 'prev', 'play', 'next'].forEach((id) => { $(`#${id}`).disabled = d <= 0; }); };
+const seek = (value) => { const t = Math.max(0, Math.min(duration(), Number(value) || 0)); loadedVideos().forEach((video) => { video.currentTime = t; }); update(); };
 const stopPlaybackSync = () => { if (syncFrame) cancelAnimationFrame(syncFrame); syncFrame = 0; after.playbackRate = 1; };
-const syncTime = (source, target) => { if (!Number.isFinite(source.duration)) return; if (Math.abs(target.currentTime - source.currentTime) > 0.08) target.currentTime = Math.min(source.currentTime, target.duration || source.currentTime); };
-const pause = () => { before.pause(); after.pause(); stopPlaybackSync(); $('#play').textContent = '▶'; };
-const play = async () => { if (!before.src || !after.src) return; if (before.paused) { try { after.currentTime = before.currentTime; await Promise.all([before.play(), after.play()]); $('#play').textContent = 'Ⅱ'; } catch (_) { pause(); } } else pause(); };
+const syncTime = (source, target) => { if (!target.hasAttribute('src') || !Number.isFinite(source.duration)) return; if (Math.abs(target.currentTime - source.currentTime) > 0.08) target.currentTime = Math.min(source.currentTime, target.duration || source.currentTime); };
+const pause = () => { before.pause(); after.pause(); stopPlaybackSync(); refreshPlaybackButton(); };
+const play = async () => { const videos = loadedVideos(); if (!videos.length) return; if (playbackVideo().paused) { try { if (videos.length === 2) after.currentTime = before.currentTime; await Promise.all(videos.map((video) => video.play())); refreshPlaybackButton(); } catch (_) { pause(); } } else pause(); };
 const setWipe = (value) => { const p = Math.max(0, Math.min(100, Number(value) || 50)); $('#wipe').value = p; afterPane.style.setProperty('clip-path', `inset(0 0 0 ${p}%)`, inspector.classList.contains('mode-compare') ? 'important' : ''); divider.style.left = `${p}%`; $('#wipe-value').textContent = `${Math.round(p)}%`; };
 const applyTransform = () => { [before, after].forEach((video) => { video.style.transformOrigin = `${originX}% ${originY}%`; video.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`; }); $('#zoom-reset').textContent = `${Math.round(zoom * 100)}%`; };
 const resetZoom = () => { zoom = 1; panX = panY = 0; originX = originY = 50; applyTransform(); };
-const setMode = (mode) => { ['original','restored','compare','side'].forEach((name) => inspector.classList.toggle(`mode-${name}`, name === mode)); document.querySelectorAll('[data-mode]').forEach((button) => button.classList.toggle('active', button.dataset.mode === mode)); afterPane.style.setProperty('clip-path', mode === 'compare' ? `inset(0 0 0 ${$('#wipe').value}%)` : 'none', 'important'); resetZoom(); updateEmptyState(); };
-const updateEmptyState = () => { const hasBefore = Boolean(before.currentSrc || before.src); const hasAfter = Boolean(after.currentSrc || after.src); const mode = ['original','restored','compare','side'].find((name) => inspector.classList.contains(`mode-${name}`)) || 'compare'; const ready = mode === 'original' ? hasBefore : mode === 'restored' ? hasAfter : hasBefore && hasAfter; $('#empty-state').hidden = ready; if (ready) return; if (mode === 'restored' && !hasAfter) { $('#empty-title').textContent = 'Waiting for restored video'; $('#empty-subtitle').textContent = 'Render a preview or full video and it will appear here automatically.'; } else if (!hasBefore) { $('#empty-title').textContent = 'Waiting for original video'; $('#empty-subtitle').textContent = 'Upload an original video to begin.'; } else { $('#empty-title').textContent = 'Waiting for restored video'; $('#empty-subtitle').textContent = 'Render a preview or full video and it will appear here automatically.'; } };
+const setMode = (mode) => { ['original','restored','compare','side'].forEach((name) => inspector.classList.toggle(`mode-${name}`, name === mode)); document.querySelectorAll('[data-mode]').forEach((button) => { const active = button.dataset.mode === mode; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); }); afterPane.style.setProperty('clip-path', mode === 'compare' ? `inset(0 0 0 ${$('#wipe').value}%)` : 'none', 'important'); resetZoom(); updateEmptyState(); };
+const updateEmptyState = () => {
+  const hasBefore = before.hasAttribute('src'), hasAfter = after.hasAttribute('src');
+  const mode = ['original','restored','compare','side'].find((name) => inspector.classList.contains(`mode-${name}`)) || 'compare';
+  const ready = mode === 'original' ? hasBefore : mode === 'restored' ? hasAfter : hasBefore && hasAfter;
+  $('#empty-state').hidden = ready; inspector.classList.toggle('is-empty', !ready);
+  $('#empty-browse').hidden = hasBefore || mode === 'restored';
+  $('#wipe').disabled = mode !== 'compare' || !ready;
+  $('#zoom-reset').disabled = !ready;
+  if (ready) return;
+  if (mode === 'restored' || hasBefore) {
+    $('#empty-title').textContent = 'Your restored video will appear here';
+    $('#empty-subtitle').textContent = 'Render a short preview to see the difference.';
+  } else {
+    $('#empty-title').textContent = 'Add a video to get started';
+    $('#empty-subtitle').textContent = 'Choose a local file, then try a short preview.';
+  }
+};
 const loadVideo = (video, url) => { if (url) video.src = url; else video.removeAttribute('src'); video.load(); updateEmptyState(); update(); };
-const setFile = (video, file, nameTarget) => { if (!file) return; if (video === before) beginNewProject(file); loadVideo(video, URL.createObjectURL(file)); $(nameTarget).textContent = file.name; $('#media-info').textContent = `${file.name} · local file`; };
+const setFile = (video, file, nameTarget) => { if (!file) return; pause(); if (video === before) beginNewProject(file); loadVideo(video, URL.createObjectURL(file)); setMode('original'); $(nameTarget).textContent = file.name; $(nameTarget).title = file.name; $('#media-info').textContent = `${file.name} · local file`; };
 
 const sourceInput = $('#source-file');
 const sourceDropzone = document.querySelector('label[for="source-file"]');
+$('#empty-browse').addEventListener('click', () => sourceInput.click());
+sourceDropzone.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); sourceInput.click(); } });
 const isVideoFile = (file) => Boolean(file && (file.type.startsWith('video/') || /\.(mp4|mov|mkv|avi|webm|m4v|mpeg|mpg)$/i.test(file.name)));
 const acceptSourceFile = (file) => {
   if (!isVideoFile(file)) { $('#media-info').textContent = 'Please choose a supported video file.'; return; }
@@ -109,13 +130,15 @@ const acceptSourceFile = (file) => {
   setFile(before, file, '#source-name');
 };
 sourceInput.addEventListener('change', (event) => acceptSourceFile(event.target.files[0]));
-['dragenter','dragover'].forEach((name) => sourceDropzone.addEventListener(name, (event) => {
-  event.preventDefault(); event.stopPropagation(); sourceDropzone.classList.add('drag-over');
-}));
-['dragleave','drop'].forEach((name) => sourceDropzone.addEventListener(name, (event) => {
-  event.preventDefault(); event.stopPropagation(); sourceDropzone.classList.remove('drag-over');
-}));
-sourceDropzone.addEventListener('drop', (event) => acceptSourceFile(event.dataTransfer?.files?.[0]));
+[sourceDropzone, stage].forEach((target) => {
+  ['dragenter','dragover'].forEach((name) => target.addEventListener(name, (event) => {
+    event.preventDefault(); event.stopPropagation(); target.classList.add('drag-over');
+  }));
+  ['dragleave','drop'].forEach((name) => target.addEventListener(name, (event) => {
+    event.preventDefault(); event.stopPropagation(); target.classList.remove('drag-over');
+  }));
+  target.addEventListener('drop', (event) => acceptSourceFile(event.dataTransfer?.files?.[0]));
+});
 ['dragover','drop'].forEach((name) => document.addEventListener(name, (event) => {
   if (Array.from(event.dataTransfer?.types || []).includes('Files')) event.preventDefault();
 }));
@@ -130,27 +153,40 @@ $('#zoom-reset').addEventListener('click', resetZoom);
 $('#fullscreen').addEventListener('click', () => (inspector.requestFullscreen || inspector.webkitRequestFullscreen)?.call(inspector));
 $('#exit-studio').addEventListener('click', async () => { if (!window.confirm('Exit SeedVR Studio? Any active render will stop and GPU/RAM will be released.')) return; $('#render-status').textContent = 'Shutting down…'; try { await fetch('/api/shutdown', {method:'POST', keepalive:true}); } catch (_) {} window.close(); });
 before.addEventListener('timeupdate', () => { syncTime(before, after); update(); });
+after.addEventListener('timeupdate', () => { if (!before.hasAttribute('src')) update(); });
 before.addEventListener('ended', pause); before.addEventListener('loadedmetadata', update); after.addEventListener('loadedmetadata', update);
+after.addEventListener('ended', pause);
+[before, after].forEach((video) => { ['play', 'pause'].forEach((name) => video.addEventListener(name, refreshPlaybackButton)); });
 stage.addEventListener('wheel', (event) => { event.preventDefault(); const rect = stage.getBoundingClientRect(); originX = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100)); originY = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100)); zoom = Math.max(1, Math.min(8, zoom * (event.deltaY < 0 ? 1.2 : 1 / 1.2))); if (zoom === 1) panX = panY = 0; applyTransform(); }, { passive:false });
 stage.addEventListener('dblclick', resetZoom);
 stage.addEventListener('pointerdown', (event) => { drag = event.target.closest('#divider') ? 'wipe' : (zoom > 1 ? 'pan' : ''); if (!drag) return; stage.setPointerCapture?.(event.pointerId); dragX = event.clientX; dragY = event.clientY; baseX = panX; baseY = panY; });
 stage.addEventListener('pointermove', (event) => { if (drag === 'wipe') setWipe(((event.clientX - stage.getBoundingClientRect().left) / stage.getBoundingClientRect().width) * 100); if (drag === 'pan') { panX = baseX + event.clientX - dragX; panY = baseY + event.clientY - dragY; applyTransform(); } });
 stage.addEventListener('pointerup', () => { drag = ''; });
-inspector.addEventListener('keydown', (event) => { if (event.target.matches('input')) return; if (event.code === 'Space') { event.preventDefault(); play(); } if (event.key === 'ArrowLeft') $('#prev').click(); if (event.key === 'ArrowRight') $('#next').click(); });
+inspector.addEventListener('keydown', (event) => { if (event.target.closest('input, button, select')) return; if (event.code === 'Space') { event.preventDefault(); play(); } if (event.key === 'ArrowLeft') { event.preventDefault(); $('#prev').click(); } if (event.key === 'ArrowRight') { event.preventDefault(); $('#next').click(); } });
 
 let selectedWorkspaceOutput = null;
 const outputPicker = $('#output-picker'); const outputPickerToggle = $('#output-picker-toggle'); const outputPickerMenu = $('#output-picker-menu'); const outputPickerLabel = $('#output-picker-label'); const outputPickerThumb = $('#output-picker-thumb');
 const closeOutputPicker = () => { outputPickerMenu.hidden = true; outputPickerToggle.setAttribute('aria-expanded', 'false'); };
-const selectWorkspaceOutput = (output) => { selectedWorkspaceOutput = output; outputPickerLabel.textContent = output.name; outputPickerThumb.src = '/api/output-thumbnail?path=' + encodeURIComponent(output.path); outputPickerToggle.classList.add('has-selection'); closeOutputPicker(); };
+const selectWorkspaceOutput = (output) => { selectedWorkspaceOutput = output; outputPickerLabel.textContent = output.name; outputPickerThumb.src = '/api/output-thumbnail?path=' + encodeURIComponent(output.path); outputPickerToggle.classList.add('has-selection'); $('#load-output').disabled = false; closeOutputPicker(); };
 outputPickerToggle.addEventListener('click', () => { outputPickerMenu.hidden = !outputPickerMenu.hidden; outputPickerToggle.setAttribute('aria-expanded', String(!outputPickerMenu.hidden)); });
 document.addEventListener('click', (event) => { if (!outputPicker.contains(event.target)) closeOutputPicker(); });
+outputPicker.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') { closeOutputPicker(); outputPickerToggle.focus(); }
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    const items = Array.from(outputPickerMenu.querySelectorAll('button'));
+    if (!items.length) return;
+    event.preventDefault(); outputPickerMenu.hidden = false; outputPickerToggle.setAttribute('aria-expanded', 'true');
+    const index = items.indexOf(document.activeElement);
+    const next = event.key === 'ArrowDown' ? (index + 1) % items.length : (index < 0 ? items.length - 1 : (index - 1 + items.length) % items.length);
+    items[next].focus();
+  }
+});
 async function loadOutputs() {
   try {
-    const response = await fetch('/api/outputs'); const outputs = await response.json(); outputPickerMenu.innerHTML = ''; selectedWorkspaceOutput = null; outputPickerLabel.textContent = outputs.length ? 'Select a workspace output…' : 'No workspace outputs yet'; outputPickerThumb.removeAttribute('src'); outputPickerToggle.classList.remove('has-selection');
+    const response = await fetch('/api/outputs'); if (!response.ok) throw new Error('Could not load outputs'); const outputs = await response.json(); outputPickerMenu.innerHTML = ''; selectedWorkspaceOutput = null; $('#load-output').disabled = true; outputPickerToggle.disabled = !outputs.length; outputPickerLabel.textContent = outputs.length ? 'Select a previous result…' : 'No results yet'; outputPickerThumb.removeAttribute('src'); outputPickerToggle.classList.remove('has-selection');
     outputs.forEach((output) => { const item = document.createElement('button'); item.type = 'button'; item.className = 'output-picker-item'; item.setAttribute('role', 'option'); const thumb = document.createElement('img'); thumb.className = 'output-item-thumb'; thumb.alt = ''; thumb.setAttribute('aria-hidden', 'true'); thumb.src = '/api/output-thumbnail?path=' + encodeURIComponent(output.path); const copy = document.createElement('span'); copy.className = 'output-item-copy'; const name = document.createElement('strong'); name.textContent = output.name; const kind = document.createElement('small'); kind.textContent = output.reprocessable ? 'TensorRT result' : 'Workspace result'; copy.append(name, kind); item.append(thumb, copy); item.addEventListener('click', () => selectWorkspaceOutput(output)); outputPickerMenu.append(item); });
-    $('#api-dot').classList.add('ok'); $('#api-status').textContent = 'API ready · ' + outputs.length + ' output' + (outputs.length === 1 ? '' : 's');
-  } catch (_) { $('#api-status').textContent = 'API unavailable'; }
-}$('#load-output').addEventListener('click', () => { const output = selectedWorkspaceOutput; if (!output) return; currentOutputPath = output.path || output.url; currentOutputReprocessable = Boolean(output.reprocessable); fps = Number(output.fps) || 30; $('#reprocess-post').hidden = !currentOutputReprocessable; $('#open-output-folder').hidden = false; loadVideo(after, output.url); $('#media-info').textContent = currentOutputReprocessable ? 'Previous result loaded · post-only reprocess available' : 'Previous workspace result loaded'; });
+  } catch (_) { outputPickerLabel.textContent = 'Could not load previous results'; }
+}$('#load-output').addEventListener('click', () => { const output = selectedWorkspaceOutput; if (!output) return; pause(); currentOutputPath = output.path || output.url; currentOutputReprocessable = Boolean(output.reprocessable); fps = Number(output.fps) || 30; $('#reprocess-post').hidden = !currentOutputReprocessable; $('#open-output-folder').hidden = false; loadVideo(after, output.url); setMode(before.hasAttribute('src') ? 'compare' : 'restored'); $('#media-info').textContent = currentOutputReprocessable ? 'Previous result loaded · post-only reprocess available' : 'Previous workspace result loaded'; });
 $('#open-output-folder').addEventListener('click', async () => { if (!currentOutputPath) return; const data = new FormData(); data.append('output_path', currentOutputPath); try { const response = await fetch('/api/open-folder', {method:'POST', body:data}); if (!response.ok) throw new Error(await response.text()); } catch (error) { $('#media-info').textContent = `Could not open folder: ${error.message}`; } });
 const chunkToggle = $('#chunked-render');
 const chunkLengthWrap = $('#chunk-length-wrap');
@@ -203,14 +239,16 @@ const requestSourceFps = () => {
   }
 };
 
-const setRenderBusy = (busy) => { renderBusy = busy; $('#recommend-settings').disabled = busy || recommendingSettings || window.__seedvrFeatures?.hardware_recommendations !== true; ['render-preview','render-full','reprocess-post'].forEach((id) => { $( `#${id}` ).disabled = busy; }); $('#stop-render').hidden = !busy; if (busy) { $('#performance-report').hidden = true; $('#resume-render').hidden = true; lastFailedJob = null; } };
+const setRenderBusy = (busy) => { renderBusy = busy; $('#recommend-settings').disabled = busy || recommendingSettings || window.__seedvrFeatures?.hardware_recommendations !== true; ['render-preview','render-full','reprocess-post'].forEach((id) => { $(`#${id}`).disabled = busy || (id !== 'reprocess-post' && !selectedSourceFile && !sourceInput.files[0]); }); $('#stop-render').hidden = !busy; $('#render-progress').hidden = !busy; if (busy) { $('#render-progress').value = 0; $('#performance-report').hidden = true; $('#resume-render').hidden = true; lastFailedJob = null; } };
+setRenderBusy(false);
 const pollJob = async (id, token = projectToken) => {
   const job = await (await fetch(`/api/jobs/${id}`)).json();
   if (token !== projectToken) return;
   window.__seedvrProgress = Number(job.progress) || 0;
+  $('#render-progress').value = window.__seedvrProgress;
   updateEta(window.__seedvrProgress);
   $('#render-status').textContent = `${job.message || job.status}${job.progress != null ? ` · ${Math.round(job.progress * 100)}%` : ''}`;
-  if (job.status === 'complete') { stopElapsed(job.elapsed_seconds); setRenderBusy(false); activeJob = null; lastProfileJob = job.id; $('#performance-report').hidden = false; if (Number(job.fps) > 0) fps = Number(job.fps); if (job.original_url) loadVideo(before, job.original_url); if (job.restored_url) loadVideo(after, job.restored_url); currentOutputPath = job.output_relative || ''; currentOutputReprocessable = Boolean(job.reprocessable); $('#reprocess-post').hidden = !currentOutputReprocessable; $('#open-output-folder').hidden = !currentOutputPath; $('#media-info').textContent = job.job_type === 'reprocess' ? 'Post-only reprocess complete' : `${job.job_type} complete`; loadOutputs(); return; }
+  if (job.status === 'complete') { pause(); stopElapsed(job.elapsed_seconds); setRenderBusy(false); activeJob = null; lastProfileJob = job.id; $('#performance-report').hidden = false; if (Number(job.fps) > 0) fps = Number(job.fps); if (job.original_url) loadVideo(before, job.original_url); if (job.restored_url) loadVideo(after, job.restored_url); setMode(before.hasAttribute('src') ? 'compare' : 'restored'); currentOutputPath = job.output_relative || ''; currentOutputReprocessable = Boolean(job.reprocessable); $('#reprocess-post').hidden = !currentOutputReprocessable; $('#open-output-folder').hidden = !currentOutputPath; $('#media-info').textContent = job.job_type === 'reprocess' ? 'Post-only reprocess complete' : `${job.job_type} complete`; loadOutputs(); return; }
   if (job.status === 'error' || job.status === 'cancelled') {
     stopElapsed(job.elapsed_seconds); setRenderBusy(false); activeJob = null;
     lastProfileJob = job.id; $('#performance-report').hidden = false;
@@ -337,7 +375,9 @@ $('#backend').addEventListener('change', () => { updateBatchOptions($('#backend'
 const setSkinBackendAvailable = (available) => { $('#skin-backend-warning').hidden = available; $('#skin-finishing').disabled = !available; if (!available) $('#skin-finishing').checked = false; refreshSettingsUi(); };
 const loadConfig = async () => {
   try {
-    const config = await (await fetch('/api/config')).json();
+    const response = await fetch('/api/config');
+    if (!response.ok) throw new Error('Configuration unavailable');
+    const config = await response.json();
     window.__seedvrBatchSizes = config.batch_sizes || defaultBatchSizes;
     window.__seedvrFeatures = config.features || {};
     window.__seedvrExportAvailable = Boolean(config.export_presets);
@@ -360,13 +400,15 @@ const loadConfig = async () => {
     });
     restoreSettings(); updateBatchOptions($('#backend').value, $('#batch-size').value);
     setSkinBackendAvailable(config.features?.skin_finishing === true);
-    $('#api-status').textContent = config.backend.seedvr?.message || 'API ready';
+    $('#api-dot').classList.toggle('ok', config.backend.seedvr?.ready === true);
+    $('#api-status').textContent = config.backend.seedvr?.ready === true ? 'Local · Connected' : 'Setup needed';
+    $('.connection').title = config.backend.seedvr?.message || 'All processing stays on this device.';
   } catch (_) {
     window.__seedvrFeatures = {}; window.__seedvrExportAvailable = false;
     $('#backend').value = 'SeedVR2 + TensorRT'; updateBatchOptions($('#backend').value); restoreSettings();
     if (!$('#backend').value) $('#backend').value = 'SeedVR2 + TensorRT';
     updateBatchOptions($('#backend').value, $('#batch-size').value); setSkinBackendAvailable(false);
-    $('#api-status').textContent = 'API ready · config unavailable';
+    $('#api-dot').classList.remove('ok'); $('#api-status').textContent = 'Service unavailable';
   }
 };
 loadConfig();

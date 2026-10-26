@@ -31,7 +31,10 @@ function rows() {
 }
 function controls() {
   const locked = loading || busy();
-  [...settingIds, 'image-add-files', 'image-add-folder', 'image-add-path', 'image-source-path', 'image-browse-output', 'image-clear', 'image-load-history'].forEach((id) => { $(id).disabled = locked || !ready; });
+  [...settingIds, 'image-add-files', 'image-empty-browse', 'image-add-folder', 'image-add-path', 'image-source-path', 'image-browse-output', 'image-clear', 'image-load-history'].forEach((id) => { $(id).disabled = locked || !ready; });
+  $('image-clear').disabled = locked || !ready || !rows().length;
+  $('image-load-history').disabled = locked || !ready || !$('image-history').value;
+  $('image-progress').hidden = !batch;
   $('image-review').disabled = locked || !ready || !paths.length;
   $('image-start').disabled = locked || !review || usedReview || !review.items.some((item) => item.status === 'pending');
   $('image-preview').disabled = locked || !review || !review.items.some((item) => item.id === selected && item.status === 'pending');
@@ -58,7 +61,11 @@ function showSelected() {
   imageUrl('image-after', item?.output_url);
   const noImage = !item || (mode === 'restored' && !item.output_url);
   $('image-empty').hidden = !noImage;
-  $('image-empty').textContent = item ? 'No restored image yet. Preview this image or start the batch.' : 'Add images or a folder, review, then preview a selected image.';
+  $('image-empty-title').textContent = item ? 'Your restored image will appear here' : 'Add images to get started';
+  $('image-empty-subtitle').textContent = item ? 'Preview this image or start the image batch.' : 'Add images or a folder to start your collection.';
+  $('image-empty-browse').hidden = Boolean(item);
+  $('image-wipe').disabled = mode !== 'compare' || !item?.output_url;
+  $('image-zoom-reset').disabled = noImage;
   // Compare without a restored image should still show the original, not an opaque blank pane.
   document.querySelector('.image-restored').hidden = !item?.output_url && mode !== 'restored';
   $('image-selected').textContent = item ? `${item.source}${item.error ? ' · ' + item.error : ''}${item.result?.fallback_reason ? ' · SeedVR fallback: ' + item.result.fallback_reason : ''}` : 'No image selected';
@@ -88,11 +95,17 @@ function renderRows() {
     tr.addEventListener('click', select); tr.addEventListener('keydown', (event) => { if (event.target === tr && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); select(); } });
     fragment.append(tr);
   });
+  if (!items.length) {
+    const tr = document.createElement('tr'); tr.className = 'image-table-empty';
+    const td = document.createElement('td'); td.colSpan = 4; td.textContent = 'Your selected images will appear here.';
+    tr.append(td); fragment.append(tr);
+  }
   $('image-items').replaceChildren(fragment);
   const completed = items.filter((item) => item.status === 'complete').length;
   const failed = items.filter((item) => item.status === 'error').length;
   const skipped = review?.skipped?.length || batch?.skipped?.length || 0;
-  $('image-count').textContent = `${items.length} image${items.length === 1 ? '' : 's'} · ${completed} completed · ${failed} errors${skipped ? ` · ${skipped} unsupported/subfolders skipped` : ''}`;
+  $('image-count').textContent = items.length ? `${items.length} image${items.length === 1 ? '' : 's'}${completed ? ` · ${completed} completed` : ''}${failed ? ` · ${failed} errors` : ''}${skipped ? ` · ${skipped} unsupported/subfolders skipped` : ''}` : 'Your image collection';
+  $('image-pagination').hidden = items.length <= pageSize;
   $('image-page').textContent = items.length ? `${page * pageSize + 1}–${Math.min(items.length, (page + 1) * pageSize)} of ${items.length}` : '0 images';
   $('image-prev-page').disabled = page === 0; $('image-next-page').disabled = (page + 1) * pageSize >= items.length;
   showSelected();
@@ -191,6 +204,7 @@ function switchWorkflow(images) {
   if (images) { document.getElementById('before')?.pause(); document.getElementById('after')?.pause(); }
 }
 $('image-add-files').addEventListener('click', () => pick('files'));
+$('image-empty-browse').addEventListener('click', () => $('image-add-files').click());
 $('image-add-folder').addEventListener('click', () => pick('source_folder'));
 $('image-browse-output').addEventListener('click', () => pick('output_folder'));
 $('image-add-path').addEventListener('click', () => {
@@ -225,11 +239,12 @@ $('image-load-history').addEventListener('click', async () => {
     showBatch(result); if (activeStates.has(result.status)) poll(result.id, ++polling); else polling += 1;
   } catch (error) { status(error.message, true); }
 });
+$('image-history').addEventListener('change', controls);
 $('image-prev-page').addEventListener('click', () => { page -= 1; renderRows(); });
 $('image-next-page').addEventListener('click', () => { page += 1; renderRows(); });
 document.querySelectorAll('[data-image-mode]').forEach((button) => button.addEventListener('click', () => {
   mode = button.dataset.imageMode; $('image-stage').dataset.imageView = mode;
-  document.querySelectorAll('[data-image-mode]').forEach((other) => other.classList.toggle('active', other === button));
+  document.querySelectorAll('[data-image-mode]').forEach((other) => { const active = other === button; other.classList.toggle('active', active); other.setAttribute('aria-pressed', String(active)); });
   resetZoom(); showSelected();
 }));
 $('image-wipe').addEventListener('input', () => $('image-stage').style.setProperty('--image-wipe', `${$('image-wipe').value}%`));
@@ -241,7 +256,6 @@ $('image-stage').addEventListener('pointermove', (event) => { if (!drag) return;
 $('image-stage').addEventListener('pointerup', () => { drag = null; });
 $('image-stage').addEventListener('pointercancel', () => { drag = null; });
 $('image-fullscreen').addEventListener('click', () => document.querySelector('.image-inspector').requestFullscreen?.());
-$('image-exit').addEventListener('click', () => $('exit-studio').click());
 ['image-before', 'image-after'].forEach((id) => $(id).addEventListener('error', () => { $('image-selected').textContent = 'Image location is unavailable or changed since review. Check the source/output folder.'; }));
 
 async function initialize() {
@@ -263,6 +277,7 @@ async function initialize() {
     const running = history.find((entry) => activeStates.has(entry.status));
     if (running) { showBatch(await request(`/batches/${running.id}`)); poll(running.id, ++polling); }
   } catch (error) { status(`Image workflow unavailable: ${error.message}. Restart Studio after updating.`, true); }
+  if (!rows().length) renderRows();
   controls();
 }
 initialize();
